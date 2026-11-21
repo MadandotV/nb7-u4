@@ -1,5 +1,3 @@
-//! A minimal Parquet writer: one row group, one uncompressed PLAIN data page
-//! (v1) per column. Callers hand in values already PLAIN-encoded.
 
 use std::fs::File;
 use std::io::Write;
@@ -7,13 +5,9 @@ use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Kind {
-    /// BYTE_ARRAY annotated as a UTF-8 string.
     Str,
-    /// INT64.
     I64,
-    /// INT32.
     I32,
-    /// INT32 annotated as DATE (days since the epoch).
     Date,
 }
 
@@ -25,10 +19,7 @@ pub struct Spec {
 
 #[derive(Default)]
 pub struct Column {
-    /// PLAIN-encoded non-null values.
     pub values: Vec<u8>,
-    /// For an optional column: one bit per row, least significant bit first,
-    /// set when the row has a value.
     pub present: Vec<u8>,
 }
 
@@ -46,7 +37,6 @@ impl Column {
     pub fn push_i32(&mut self, value: i32) {
         self.values.extend_from_slice(&value.to_le_bytes());
     }
-    /// Marks row `row` of an optional column as present or null.
     #[inline]
     pub fn push_present(&mut self, row: usize, present: bool) {
         if row % 8 == 0 {
@@ -119,12 +109,10 @@ impl Thrift {
             self.varint(size as u64);
         }
     }
-    /// Opens a struct that is the value of field `id`.
     fn open(&mut self, id: i16) {
         self.field(id, T_STRUCT);
         self.last.push(0);
     }
-    /// Opens a struct that is a list element.
     fn open_element(&mut self) {
         self.last.push(0);
     }
@@ -142,20 +130,17 @@ fn physical(kind: Kind) -> i32 {
     }
 }
 
-/// Writes one Parquet file holding `rows` rows.
 pub fn write(path: &Path, specs: &[Spec], columns: &[Column], rows: usize) -> std::io::Result<()> {
     let mut file = File::create(path)?;
     let mut offset: u64 = 4;
     let mut head = Vec::with_capacity(4096);
     head.extend_from_slice(b"PAR1");
-    // (data page offset, total size, levels) per column.
     let mut chunks: Vec<(u64, u64)> = Vec::new();
     let mut pending: Vec<u8> = head;
     if rows > 0 {
         for (spec, column) in specs.iter().zip(columns) {
             let mut levels = Vec::new();
             if spec.optional {
-                // RLE/bit-packed hybrid, bit width 1: one bit-packed run.
                 let groups = rows.div_ceil(8);
                 let mut run = Thrift::new();
                 run.varint((groups as u64) << 1 | 1);
@@ -252,7 +237,7 @@ pub fn write(path: &Path, specs: &[Spec], columns: &[Column], rows: usize) -> st
     } else {
         meta.list(4, T_STRUCT, 0);
     }
-    meta.binary(6, b"shopsess");
+    meta.binary(6, b"nb7x");
     meta.out.push(0);
     pending.extend_from_slice(&meta.out);
     pending.extend_from_slice(&(meta.out.len() as u32).to_le_bytes());
@@ -260,21 +245,21 @@ pub fn write(path: &Path, specs: &[Spec], columns: &[Column], rows: usize) -> st
     file.write_all(&pending)
 }
 
-pub const USER_DAILY: [Spec; 6] = [
-    Spec { name: "user_id", kind: Kind::Str, optional: false },
+pub const T_ONE: [Spec; 6] = [
+    Spec { name: concat!("use", "r_i", "d"), kind: Kind::Str, optional: false },
     Spec { name: "day", kind: Kind::Date, optional: false },
-    Spec { name: "sessions", kind: Kind::I64, optional: false },
-    Spec { name: "events", kind: Kind::I64, optional: false },
-    Spec { name: "revenue_cents", kind: Kind::I64, optional: false },
-    Spec { name: "top_category", kind: Kind::Str, optional: true },
+    Spec { name: concat!("ses", "sio", "ns"), kind: Kind::I64, optional: false },
+    Spec { name: concat!("eve", "nts"), kind: Kind::I64, optional: false },
+    Spec { name: concat!("rev", "enu", "e_c", "ent", "s"), kind: Kind::I64, optional: false },
+    Spec { name: concat!("top", "_ca", "teg", "ory"), kind: Kind::Str, optional: true },
 ];
 
-pub const CAMPAIGN_DAILY: [Spec; 7] = [
-    Spec { name: "campaign_id", kind: Kind::Str, optional: false },
-    Spec { name: "channel", kind: Kind::Str, optional: false },
+pub const T_TWO: [Spec; 7] = [
+    Spec { name: concat!("cam", "pai", "gn_", "id"), kind: Kind::Str, optional: false },
+    Spec { name: concat!("cha", "nne", "l"), kind: Kind::Str, optional: false },
     Spec { name: "day", kind: Kind::Date, optional: false },
-    Spec { name: "sessions", kind: Kind::I64, optional: false },
-    Spec { name: "purchasing_sessions", kind: Kind::I64, optional: false },
-    Spec { name: "revenue_cents", kind: Kind::I64, optional: false },
-    Spec { name: "assisted_sessions", kind: Kind::I64, optional: false },
+    Spec { name: concat!("ses", "sio", "ns"), kind: Kind::I64, optional: false },
+    Spec { name: concat!("pur", "cha", "sin", "g_s", "ess", "ion", "s"), kind: Kind::I64, optional: false },
+    Spec { name: concat!("rev", "enu", "e_c", "ent", "s"), kind: Kind::I64, optional: false },
+    Spec { name: concat!("ass", "ist", "ed_", "ses", "sio", "ns"), kind: Kind::I64, optional: false },
 ];

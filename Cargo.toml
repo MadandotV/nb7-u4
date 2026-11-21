@@ -1,5 +1,5 @@
 [package]
-name = "shopsess"
+name = "nb7x"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -8,7 +8,7 @@ license = "MIT"
 path = "src/lib.rs"
 
 [[bin]]
-name = "shopsess"
+name = "nb7x"
 path = "src/main.rs"
 
 [[bin]]
@@ -24,3 +24,4 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+

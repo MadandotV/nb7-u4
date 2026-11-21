@@ -1,4 +1,3 @@
-//! The slow oracle as a standalone binary: `reference DATA_DIR OUTPUT_DIR`.
 use std::path::PathBuf;
 
 fn main() {
@@ -10,5 +9,5 @@ fn main() {
             PathBuf::from(std::env::var(name).unwrap())
         }
     };
-    shopsess::slow::run(&pick(0, "DATA_DIR"), &pick(1, "OUTPUT_DIR"));
+    nb7x::slow::run(&pick(0, "DATA_DIR"), &pick(1, "OUTPUT_DIR"));
 }

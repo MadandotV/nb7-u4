@@ -1,16 +1,11 @@
-//! Memory for the partitioned record streams: zeroed mappings, a bump arena
-//! per thread, and a scatter that fills each partition a cache line at a time.
 
 use std::arch::x86_64::*;
 
 const HUGE: usize = 2 << 20;
 
-/// How the kernel hands out 2 MB pages.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Huge {
-    /// To any large mapping.
     Always,
-    /// Only to mappings that ask.
     OnRequest,
     Never,
 }
@@ -21,7 +16,7 @@ pub fn huge_pages() -> Huge {
     *MODE.get_or_init(|| {
         let mode = std::fs::read("/sys/kernel/mm/transparent_hugepage/enabled").unwrap_or_default();
         let has = |word: &[u8]| mode.windows(word.len()).any(|window| window == word);
-        if std::env::var_os("SHOPSESS_SMALL_PAGES").is_some() {
+        if std::env::var_os("NB7X_SMALL_PAGES").is_some() {
             Huge::Never
         } else if has(b"[always]") {
             Huge::Always
@@ -33,12 +28,6 @@ pub fn huge_pages() -> Huge {
     })
 }
 
-/// Zeroed memory that is never freed, aligned to 2 MB so that it can sit on
-/// 2 MB pages: the record streams and tables are written all over, and with
-/// 4 KB pages most of those writes miss the TLB. It asks for large pages
-/// only where the kernel needs asking, since asking also lets the kernel
-/// stall the caller to defragment memory. `populate` maps small pages now,
-/// in one call, when large ones are not to be had.
 pub fn zeroed(bytes: usize, populate: bool) -> *mut u8 {
     let bytes = bytes.max(4096);
     let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
@@ -61,12 +50,8 @@ pub fn zeroed(bytes: usize, populate: bool) -> *mut u8 {
     }
 }
 
-/// A thread's bump allocator. It reserves address space once, so that
-/// growing it never takes the process-wide lock that `mmap` does, and maps
-/// the pages a step at a time just ahead of their use.
 pub struct Arena {
     at: *mut u8,
-    /// Pages before this are mapped.
     mapped: *mut u8,
     end: *mut u8,
     regions: Vec<(*mut u8, usize)>,
@@ -76,7 +61,6 @@ pub struct Arena {
 const STEP: usize = 2 << 20;
 
 impl Arena {
-    /// `reserve` is how much address space to set aside at a time.
     pub fn leak(reserve: usize) -> *mut Arena {
         Box::leak(Box::new(Arena {
             at: std::ptr::null_mut(),
@@ -87,10 +71,8 @@ impl Arena {
         }))
     }
 
-    /// Gives the memory back. Nothing may use it afterwards.
     pub unsafe fn release(&mut self) {
         if huge_pages() != Huge::Never {
-            // A few hundred large pages cost the exit next to nothing.
             return;
         }
         for &(at, _) in &self.regions {
@@ -99,7 +81,6 @@ impl Arena {
         }
     }
 
-    /// `bytes` of zeroed memory aligned to 64 bytes.
     #[inline]
     pub unsafe fn alloc(&mut self, bytes: usize) -> *mut u8 {
         let bytes = (bytes + 63) & !63;
@@ -113,7 +94,6 @@ impl Arena {
         let out = self.at;
         self.at = self.at.add(bytes);
         while self.mapped < self.at && huge_pages() == Huge::Never {
-            // Without this call the pages are mapped one fault at a time, which is slower but works.
             libc::madvise(self.mapped as *mut libc::c_void, STEP, libc::MADV_POPULATE_WRITE);
             self.mapped = self.mapped.add(STEP);
         }
@@ -123,25 +103,19 @@ impl Arena {
 
 struct Stream<T> {
     chunks: Vec<*mut T>,
-    /// Records written to the chunks.
     len: usize,
     at: *mut T,
     end: *mut T,
 }
 
-/// Records partitioned into streams of fixed-size chunks. `K` records fill a
-/// whole number of cache lines, and a partition's records are staged in a
-/// buffer that size and written out with non-temporal stores.
 pub struct Scatter<T: Copy, const K: usize> {
     arena: *mut Arena,
     buffers: *mut T,
-    /// Records pushed to each partition.
     counts: Vec<u32>,
     streams: Vec<Stream<T>>,
 }
 
 impl<T: Copy, const K: usize> Scatter<T, K> {
-    /// Records per chunk.
     pub const RECORDS: usize = (1 << 14) / (K * std::mem::size_of::<T>()) * K;
     const BYTES: usize = K * std::mem::size_of::<T>();
 
@@ -157,7 +131,6 @@ impl<T: Copy, const K: usize> Scatter<T, K> {
         }
     }
 
-    /// Appends to a partition and returns the record's index in it.
     #[inline(always)]
     pub unsafe fn push(&mut self, part: usize, value: T) -> usize {
         let count = self.counts.get_unchecked_mut(part);
@@ -194,7 +167,6 @@ impl<T: Copy, const K: usize> Scatter<T, K> {
         stream.len += K;
     }
 
-    /// Writes out the partly filled buffers. Call once, after the last push.
     pub unsafe fn finish(&mut self) {
         for part in 0..self.counts.len() {
             let fill = self.counts[part] as usize % K;
@@ -227,7 +199,6 @@ impl<T: Copy, const K: usize> Scatter<T, K> {
         }
     }
 
-    /// Record `index` of a partition.
     #[inline(always)]
     pub unsafe fn at(&self, part: usize, index: usize) -> *mut T {
         self.streams.get_unchecked(part).chunks.get_unchecked(index / Self::RECORDS).add(index % Self::RECORDS)

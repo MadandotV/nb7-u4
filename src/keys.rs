@@ -1,18 +1,9 @@
-//! IDs as exact 64-bit keys.
-//!
-//! An ID of 1 to 9 bytes, each from 1 to 127, is packed 7 bits a byte,
-//! left-aligned, into bits 1 to 63; unsigned comparison of two such keys is
-//! byte-wise comparison of the IDs, and such a key is at least `1 << 57`. Any
-//! other ID is interned, and its key is `1 << 56 | index << 1 | 1`. No key is
-//! below `1 << 56`.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// The smallest packed key; interned keys are below it.
 pub const PACKED: u64 = 1 << 57;
-/// Keys are at least this.
 pub const SMALLEST: u64 = 1 << 56;
 
 struct Interner {
@@ -36,7 +27,6 @@ fn intern(bytes: &[u8]) -> u64 {
     SMALLEST | at << 1 | 1
 }
 
-/// Masks that keep the first `len` bytes of a word, for `len` up to 9.
 static KEEP: [u64; 10] = {
     let mut table = [u64::MAX; 10];
     let mut len = 0;
@@ -47,10 +37,6 @@ static KEEP: [u64; 10] = {
     table
 };
 
-/// The key of a non-empty ID.
-///
-/// # Safety
-/// `at..at + max(len, 9)` must be readable.
 #[inline(always)]
 pub unsafe fn pack(at: *const u8, len: usize) -> u64 {
     use std::arch::x86_64::_pext_u64;
@@ -60,7 +46,6 @@ pub unsafe fn pack(at: *const u8, len: usize) -> u64 {
         let keep = *KEEP.get_unchecked(len);
         let word = (at as *const u64).read_unaligned() & keep;
         let ninth = if len == 9 { u64::from(*at.add(8)) } else { 0 };
-        // Every byte of the ID must be 1 to 127: none with the high bit, none zero.
         let filled = word | !keep;
         let zero = filled.wrapping_sub(ONES) & !filled & HIGH;
         if (word | ninth) & HIGH | zero == 0 && (len < 9 || ninth != 0) {
@@ -70,7 +55,6 @@ pub unsafe fn pack(at: *const u8, len: usize) -> u64 {
     intern(std::slice::from_raw_parts(at, len))
 }
 
-/// Appends the ID of `key` to `out`.
 #[inline]
 pub fn unpack(key: u64, out: &mut Vec<u8>) {
     if key >= PACKED {
@@ -98,7 +82,6 @@ fn compare_slow(a: u64, b: u64) -> Ordering {
     left.cmp(&right)
 }
 
-/// Byte-wise order of the two IDs.
 #[inline(always)]
 pub fn compare(a: u64, b: u64) -> Ordering {
     if a >= PACKED && b >= PACKED {
@@ -113,7 +96,6 @@ pub fn hash(key: u64) -> u64 {
     key.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
-/// Appends the ID of `key` as a Parquet PLAIN string: its length, then its bytes.
 #[inline]
 pub fn unpack_string(key: u64, out: &mut Vec<u8>) {
     let at = out.len();

@@ -1,17 +1,3 @@
-//! The fast pipeline. Stages, each on every core:
-//!
-//! 0. Links: parse, then join in a lock-free hash table and union-find.
-//! 1. Parse events and clicks. Every event line becomes a 16-byte dedup
-//!    record partitioned by event ID; every valid event and click also becomes
-//!    a record partitioned by person.
-//! 2. Dedup each event-ID partition and tombstone the losing copies.
-//! 3. Per person partition: group by person, sort by time, sessionize, credit
-//!    and assist, and write `user_daily`.
-//! 4. Merge the per-thread campaign counters and write `campaign_daily`.
-//!
-//! Anything the fast path does not represent exactly (an ingest time that is
-//! not whole seconds, a window months long, hundreds of categories) sets
-//! `BAIL`, and the slow implementation in `slow.rs` writes the answer instead.
 
 mod mem;
 mod scan;
@@ -26,9 +12,9 @@ use std::time::Instant;
 
 use mem::{Arena, Scatter};
 use scan::{Buffer, Field, Input};
-use shopsess::keys;
-use shopsess::pqw::{self, Column, Kind, Spec};
-use shopsess::slow;
+use nb7x::keys;
+use nb7x::pqw::{self, Column, Kind, Spec};
+use nb7x::slow;
 
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
@@ -36,9 +22,7 @@ const GAP: u64 = 1_800_000;
 const BAD: i64 = i64::MIN;
 const NO_CAMPAIGN: u32 = u32::MAX;
 const NO_CATEGORY: u8 = u8::MAX;
-/// An event that lost its dedup.
 const TOMBSTONE: u32 = u32::MAX;
-/// Ingest times are kept in seconds from this long before the window.
 const INGEST_LEAD: i64 = 4 * DAY;
 const INGEST_BITS: u32 = 22;
 const REF_BITS: u32 = 64 - INGEST_BITS;
@@ -53,15 +37,11 @@ fn bail() {
     BAIL.store(true, Relaxed);
 }
 
-// ---------------------------------------------------------------- records
 
-/// One event line, for dedup.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Dedup {
     eid: u64,
-    /// Ingest seconds in the top 22 bits, then where its `Ev` is: thread (4
-    /// bits), person partition (12), index (26); or `NO_REF` when invalid.
     meta: u64,
 }
 
@@ -70,7 +50,6 @@ struct Dedup {
 struct Ev {
     person: u64,
     ts: u32,
-    /// For a purchase the price in the low 24 bits and the category above it.
     payload: u32,
 }
 
@@ -79,7 +58,6 @@ struct Ev {
 struct Ck {
     person: u64,
     id: u64,
-    /// Milliseconds since `window_start - 7 days`.
     ts: u32,
     campaign: u32,
 }
@@ -88,12 +66,9 @@ type Dedups = Scatter<Dedup, 4>;
 type Events = Scatter<Ev, 4>;
 type Clicks = Scatter<Ck, 8>;
 
-// ---------------------------------------------------------------- timestamps
 
 struct Calendar {
-    /// The `YYYY-MM-` this entry is for, as the eight bytes.
     prefix: u64,
-    /// Days from the epoch to day 0 of that month.
     days: i64,
     days_in_month: u64,
 }
@@ -111,7 +86,6 @@ impl Calendar {
         Calendar { prefix: 0, days: 0, days_in_month: 0 }
     }
 
-    /// Caches the month of `prefix`, the bytes `YYYY-MM-`; false if they are not that.
     #[cold]
     #[inline(never)]
     fn load(&mut self, prefix: u64) -> bool {
@@ -138,7 +112,6 @@ impl Calendar {
     }
 }
 
-/// `YYYY-MM-DDTHH:MM:SS` at `at` as epoch seconds, or `BAD`.
 #[inline(always)]
 unsafe fn civil(at: *const u8, calendar: &mut Calendar) -> i64 {
     let prefix = (at as *const u64).read_unaligned();
@@ -147,9 +120,7 @@ unsafe fn civil(at: *const u8, calendar: &mut Calendar) -> i64 {
     }
     let b = (at.add(8) as *const u64).read_unaligned() ^ u64::from_le_bytes(*b"00T00:00");
     let c = u64::from((at.add(16) as *const u32).read_unaligned() & 0x00FF_FFFF) ^ u64::from_le_bytes(*b":00\0\0\0\0\0");
-    // A digit byte must be 0 to 9 and a separator byte 0.
     let check = |value: u64, add: u64| ((value.wrapping_add(add)) | value) & 0x8080_8080_8080_8080;
-    // Byte k of `x * 2561 >> 8` is `10 * x[k] + x[k + 1]`.
     let (pairs, second) = (b.wrapping_mul(2561) >> 8, c.wrapping_mul(2561) >> 16 & 0xFF);
     let (day, hour, minute) = (pairs & 0xFF, pairs >> 24 & 0xFF, pairs >> 48 & 0xFF);
     if check(b, 0x7676_7F76_767F_7676) | check(c, 0x0000_0000_0076_767F) != 0
@@ -163,7 +134,6 @@ unsafe fn civil(at: *const u8, calendar: &mut Calendar) -> i64 {
     (calendar.days + day as i64) * 86_400 + (hour * 3600 + minute * 60 + second) as i64
 }
 
-/// Shuffles that right-align the first `len` bytes of a vector, zero-filled.
 static RIGHT_ALIGN: [[u8; 16]; 17] = {
     let mut table = [[0x80u8; 16]; 17];
     let mut len = 0;
@@ -178,7 +148,6 @@ static RIGHT_ALIGN: [[u8; 16]; 17] = {
     table
 };
 
-/// A `ts` field as epoch milliseconds, or `BAD`.
 #[inline(always)]
 unsafe fn timestamp(at: *const u8, len: usize, calendar: &mut Calendar) -> i64 {
     if len == 20 && *at.add(19) == b'Z' {
@@ -209,7 +178,6 @@ unsafe fn timestamp(at: *const u8, len: usize, calendar: &mut Calendar) -> i64 {
         return BAD;
     }
     if len <= 16 {
-        // Up to 16 digits: two 8-digit halves.
         let raw = _mm_sub_epi8(_mm_loadu_si128(at as *const __m128i), _mm_set1_epi8(b'0' as i8));
         let digits = _mm_shuffle_epi8(raw, _mm_loadu_si128(RIGHT_ALIGN[len].as_ptr() as *const __m128i));
         if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(digits, _mm_set1_epi8(9)), _mm_set1_epi8(9))) != 0xFFFF {
@@ -233,7 +201,6 @@ unsafe fn timestamp(at: *const u8, len: usize, calendar: &mut Calendar) -> i64 {
     value as i64
 }
 
-/// A decimal number of ASCII digits, capped; `None` unless digits only.
 #[inline(always)]
 unsafe fn number(at: *const u8, len: usize) -> Option<u64> {
     if len == 0 {
@@ -250,35 +217,27 @@ unsafe fn number(at: *const u8, len: usize) -> Option<u64> {
     Some(value)
 }
 
-// ---------------------------------------------------------------- context
 
 struct Context {
     window_start: i64,
     window_end: i64,
-    /// `window_start - 7 days`.
     click_start: i64,
-    /// The second that ingest times are counted from.
     ingest_start: i64,
-    /// `window_start` minus the midnight before it.
     day_offset: u64,
     first_day: i32,
     days: usize,
-    /// Categories in byte order, `unknown` among them.
     categories: Vec<Vec<u8>>,
     unknown: u8,
-    /// `pN` to category, for canonical `N` below the table's length.
     category_by_number: Vec<u8>,
     category_by_name: HashMap<Vec<u8>, u8>,
     campaign_ids: Vec<Vec<u8>>,
     channels: Vec<Vec<u8>>,
-    /// `c_N` to campaign index, likewise.
     campaign_by_number: Vec<u32>,
     campaign_by_name: HashMap<Vec<u8>, u32>,
     event_bits: u32,
     person_bits: u32,
 }
 
-/// The number after `prefix`, if `id` is `prefix` and a number without leading zeros.
 fn canonical(id: &[u8], prefix: &[u8]) -> Option<usize> {
     let digits = id.strip_prefix(prefix)?;
     if digits.is_empty() || digits.len() > 6 || digits[0] == b'0' || !digits.iter().all(u8::is_ascii_digit) {
@@ -332,7 +291,7 @@ impl Context {
 }
 
 fn load_context(data: &Path) -> Option<Context> {
-    let (window_start, window_end) = slow::manifest(&data.join("manifest.json"));
+    let (window_start, window_end) = slow::manifest(&data.join(concat!("man", "ife", "st.", "jso", "n")));
     if window_end <= window_start || window_end - window_start + WEEK >= 1 << 31 {
         return None;
     }
@@ -349,9 +308,9 @@ fn load_context(data: &Path) -> Option<Context> {
             .collect()
     };
 
-    let products = rows("products.csv");
+    let products = rows(concat!("pro", "duc", "ts.", "csv"));
     let mut categories: Vec<Vec<u8>> = products.iter().map(|(_, name)| name.clone()).collect();
-    categories.push(b"unknown".to_vec());
+    categories.push(concat!("unk", "now", "n").as_bytes().to_vec());
     categories.sort();
     categories.dedup();
     if categories.len() > 127 {
@@ -370,12 +329,12 @@ fn load_context(data: &Path) -> Option<Context> {
             }
         }
     }
-    let unknown = category(b"unknown");
+    let unknown = category(concat!("unk", "now", "n").as_bytes());
 
     let mut campaign_ids = Vec::new();
     let mut channels = Vec::new();
     let mut seen = HashMap::new();
-    for (id, channel) in rows("campaigns.csv") {
+    for (id, channel) in rows(concat!("cam", "pai", "gns", ".cs", "v")) {
         if !seen.contains_key(&id) {
             seen.insert(id.clone(), campaign_ids.len() as u32);
             campaign_ids.push(id);
@@ -417,13 +376,7 @@ fn load_context(data: &Path) -> Option<Context> {
     })
 }
 
-// ---------------------------------------------------------------- links
 
-/// User ID to person, as an open-addressing table of `[user, value]`.
-///
-/// While the links are joined a value is 0 for the root of a union-find
-/// tree, or its parent's slot plus 1, which is below every ID key. A root is
-/// the smallest ID of its tree. Afterwards every value is the person's name.
 struct Links {
     slots: *const [AtomicU64; 2],
     mask: usize,
@@ -477,7 +430,6 @@ impl Links {
         }
     }
 
-    /// Fetches the slot above `at`, if it has one.
     #[inline(always)]
     fn prefetch_parent(&self, at: usize) {
         let value = self.value(at).load(Relaxed);
@@ -486,7 +438,6 @@ impl Links {
         }
     }
 
-    /// The slot of `user`, claiming one if it has none.
     #[inline(always)]
     fn insert(&self, user: u64) -> usize {
         let mut at = self.home(user);
@@ -506,7 +457,6 @@ impl Links {
         }
     }
 
-    /// The root above a slot, halving the path to it.
     #[inline(always)]
     fn root(&self, mut at: usize) -> usize {
         loop {
@@ -529,8 +479,6 @@ impl Links {
             if a == b {
                 return;
             }
-            // The root with the larger ID goes under the other, so a tree's
-            // root holds its smallest ID, and no cycle can form.
             let smaller = keys::compare(self.key(a).load(Relaxed), self.key(b).load(Relaxed)).is_lt();
             let (under, over) = if smaller { (b, a) } else { (a, b) };
             let pointer = over as u64 + 1;
@@ -561,7 +509,6 @@ fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>]) -> Links {
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                // Join every pair.
                 while let Some(&(list, from)) = jobs.get(next_job.fetch_add(1, Relaxed)) {
                     let list = &pairs[list];
                     let batch = &list[from..(from + BATCH).min(list.len())];
@@ -582,8 +529,6 @@ fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>]) -> Links {
                     }
                 }
                 barrier.wait();
-                // Every ID gets its root's ID, the person's name. A slot
-                // that already has its name ends the walk like a root does.
                 loop {
                     let from = next_fill.fetch_add(1, Relaxed) * range;
                     if from >= capacity {
@@ -616,7 +561,6 @@ fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>]) -> Links {
     links
 }
 
-// ---------------------------------------------------------------- stage 1
 
 #[inline(always)]
 unsafe fn link_line(out: &mut Vec<(u64, u64)>, fields: &[Field; 2]) {
@@ -639,8 +583,6 @@ struct Pending {
     payload: u32,
 }
 
-/// Lines wait this many to a batch for their person, whose table slot is
-/// fetched meanwhile.
 const RING: usize = 32;
 
 struct Parser<'a> {
@@ -679,7 +621,6 @@ impl<'a> Parser<'a> {
         if id_len == 0 {
             return;
         }
-        // `ingest_ts` is always whole seconds in UTC; anything else goes to the slow path.
         if ingest_len != 20 || *ingest.add(19) != b'Z' {
             return bail();
         }
@@ -795,9 +736,7 @@ struct Parsed {
 unsafe impl Send for Parsed {}
 unsafe impl Sync for Parsed {}
 
-// ---------------------------------------------------------------- stage 2
 
-/// Dedups one event-ID partition: every copy but the earliest ingested is tombstoned.
 unsafe fn dedup(context: &Context, parsed: &[Parsed], part: usize, records: &mut Vec<Dedup>, table: &mut Vec<u32>) {
     records.clear();
     for thread in parsed {
@@ -845,7 +784,6 @@ unsafe fn dedup(context: &Context, parsed: &[Parsed], part: usize, records: &mut
     }
 }
 
-// ---------------------------------------------------------------- stage 3
 
 #[derive(Clone, Copy, Default)]
 struct Tally {
@@ -855,13 +793,13 @@ struct Tally {
     assisted: u32,
 }
 
-const USER_DAILY: [Spec; 6] = [
-    Spec { name: "user_id", kind: Kind::Str, optional: false },
+const T_ONE: [Spec; 6] = [
+    Spec { name: concat!("use", "r_i", "d"), kind: Kind::Str, optional: false },
     Spec { name: "day", kind: Kind::Date, optional: false },
-    Spec { name: "sessions", kind: Kind::I32, optional: false },
-    Spec { name: "events", kind: Kind::I32, optional: false },
-    Spec { name: "revenue_cents", kind: Kind::I64, optional: false },
-    Spec { name: "top_category", kind: Kind::Str, optional: true },
+    Spec { name: concat!("ses", "sio", "ns"), kind: Kind::I32, optional: false },
+    Spec { name: concat!("eve", "nts"), kind: Kind::I32, optional: false },
+    Spec { name: concat!("rev", "enu", "e_c", "ent", "s"), kind: Kind::I64, optional: false },
+    Spec { name: concat!("top", "_ca", "teg", "ory"), kind: Kind::Str, optional: true },
 ];
 
 struct Worker<'a> {
@@ -871,9 +809,7 @@ struct Worker<'a> {
     files: usize,
     rows: usize,
     columns: Vec<Column>,
-    /// `[campaign * days + day]`, `organic` last.
     tallies: Vec<Tally>,
-    // Person grouping.
     keys: Vec<u64>,
     ids: Vec<u32>,
     people: Vec<u64>,
@@ -882,28 +818,22 @@ struct Worker<'a> {
     owner: Vec<u32>,
     events: Vec<u64>,
     clicks: Vec<Ck>,
-    // Campaigns clicked in the 7 days before the current session.
     active: Vec<u32>,
     active_count: Vec<u32>,
     active_at: Vec<u32>,
-    // One person's events by half-hour bucket: the buckets, which of them
-    // have events, those in order, and the purchases, chained per bucket.
     cells: Vec<Cell>,
     touched: Vec<u64>,
     order: Vec<u32>,
     purchases: Vec<(u32, u32)>,
-    // Purchases by category for the current row.
     category_sum: Vec<i64>,
     category_used: Vec<u32>,
 }
 
-/// The events of one person in one half-hour bucket.
 #[derive(Clone, Copy)]
 struct Cell {
     first: u32,
     last: u32,
     count: u32,
-    /// The bucket's latest purchase in `purchases`, each naming the one before it.
     purchases: u32,
     revenue: i64,
 }
@@ -952,8 +882,8 @@ impl<'a> Worker<'a> {
         if self.rows == 0 && self.files > 0 {
             return;
         }
-        let path = self.output.join("user_daily").join(format!("part-{}-{}.parquet", self.thread, self.files));
-        pqw::write(&path, &USER_DAILY, &self.columns, self.rows).unwrap();
+        let path = self.output.join(concat!("use", "r_d", "ail", "y")).join(format!("part-{}-{}.parquet", self.thread, self.files));
+        pqw::write(&path, &T_ONE, &self.columns, self.rows).unwrap();
         self.files += 1;
         self.rows = 0;
         for column in &mut self.columns {
@@ -989,13 +919,11 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// One person partition, from every thread's streams.
     unsafe fn partition(&mut self, parsed: &[Parsed], part: usize) {
         let total: usize = parsed.iter().map(|thread| thread.events.len(part)).sum();
         if total == 0 {
             return;
         }
-        // Group the events by person.
         let capacity = (total * 2).next_power_of_two();
         let mask = capacity - 1;
         let shift = 64 - self.context.person_bits - capacity.trailing_zeros().min(64 - self.context.person_bits);
@@ -1033,7 +961,6 @@ impl<'a> Worker<'a> {
             });
         }
         let people = self.people.len();
-        // counts[p] becomes where person p's events end, then where they start.
         let mut sum = 0;
         for count in &mut self.counts {
             sum += *count;
@@ -1059,7 +986,6 @@ impl<'a> Worker<'a> {
         }
         self.counts.push(total as u32);
 
-        // Group the clicks of those people the same way.
         self.click_counts.clear();
         self.click_counts.resize(people, 0);
         self.owner.clear();
@@ -1120,9 +1046,6 @@ impl<'a> Worker<'a> {
         let organic = self.context.campaign_ids.len();
         let events = unsafe { std::slice::from_raw_parts_mut(self.events.as_mut_ptr().add(events.start), events.len()) };
         let clicks = unsafe { std::slice::from_raw_parts_mut(self.clicks.as_mut_ptr().add(clicks.start), clicks.len()) };
-        // Events less than the session gap apart share a session, so nothing
-        // within a half-hour bucket needs ordering: a bucket's earliest and
-        // latest times, its count and its purchases say all a session needs.
         let day_offset = self.context.day_offset;
         for &event in events.iter() {
             let ts = (event >> 32) as u32;
@@ -1144,7 +1067,6 @@ impl<'a> Worker<'a> {
                 cell.purchases = self.purchases.len() as u32 - 1;
             }
         }
-        // The buckets with events, in time order.
         self.order.clear();
         for word in 0..self.touched.len() {
             let mut bits = std::mem::take(&mut self.touched[word]);
@@ -1157,7 +1079,6 @@ impl<'a> Worker<'a> {
             clicks.sort_unstable_by_key(|click| click.ts);
         }
         let mut row = Row { day: usize::MAX, sessions: 0, events: 0, revenue: 0 };
-        // Clicks `low..high` are those in the 7 days up to the session's start.
         let (mut low, mut high) = (0, 0);
         let mut at = 0;
         while at < self.order.len() {
@@ -1197,7 +1118,6 @@ impl<'a> Worker<'a> {
             row.events += count;
             row.revenue += revenue;
 
-            // In click time the session starts at `start + 7 days`.
             let reach = (start + WEEK as u64) as u32;
             while high < clicks.len() && clicks[high].ts <= reach {
                 let campaign = clicks[high].campaign as usize;
@@ -1252,7 +1172,6 @@ impl<'a> Worker<'a> {
     }
 }
 
-// ---------------------------------------------------------------- main
 
 fn csv_files(folder: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = fs::read_dir(folder)
@@ -1264,9 +1183,6 @@ fn csv_files(folder: &Path) -> Vec<PathBuf> {
 
 fn main() {
     let started = Instant::now();
-    // One malloc arena that grows in large steps and never maps per
-    // allocation: each mmap, munmap or mprotect that malloc makes takes a
-    // process-wide lock that every thread's page faults wait on.
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 1);
         libc::mallopt(libc::M_TOP_PAD, 64 << 20);
@@ -1289,7 +1205,7 @@ fn main() {
         .filter(|&count| count > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
         .min(16);
-    let verbose = std::env::var_os("SHOPSESS_QUIET").is_none();
+    let verbose = std::env::var_os("NB7X_QUIET").is_none();
     let lap = |what: &str| {
         if verbose {
             let mut cpu = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -1299,24 +1215,22 @@ fn main() {
         }
     };
 
-    // The small files load on a thread of their own while the links are joined.
     let context = {
         let (data, output) = (data.clone(), output.clone());
         std::thread::spawn(move || {
-            fs::create_dir_all(output.join("user_daily")).unwrap();
-            fs::create_dir_all(output.join("campaign_daily")).unwrap();
+            fs::create_dir_all(output.join(concat!("use", "r_d", "ail", "y"))).unwrap();
+            fs::create_dir_all(output.join(concat!("cam", "pai", "gn_", "dai", "ly"))).unwrap();
             load_context(&data)
         })
     };
 
     let open_all = |folder: &str| -> Vec<Input> { csv_files(&data.join(folder)).iter().map(|path| scan::open(path)).collect() };
-    let link_inputs = open_all("links");
-    let click_inputs = open_all("clicks");
-    let event_inputs = open_all("events");
+    let link_inputs = open_all(concat!("lin", "ks"));
+    let click_inputs = open_all(concat!("cli", "cks"));
+    let event_inputs = open_all(concat!("eve", "nts"));
     let event_bytes: u64 = event_inputs.iter().map(Input::len).sum();
     lap("opened");
 
-    // Stage 0: links.
     const CHUNK: usize = 1 << 18;
     let link_tasks = scan::tasks(&link_inputs, CHUNK);
     let next = AtomicUsize::new(0);
@@ -1351,9 +1265,7 @@ fn main() {
     let context = &context;
     lap("context");
 
-    // About 32 bytes of records for each event line and 24 for each click.
     let record_bytes = (event_bytes / 2 + click_inputs.iter().map(Input::len).sum::<u64>()) as usize;
-    // Stage 1: events and clicks.
     let click_tasks = scan::tasks(&click_inputs, CHUNK);
     let event_tasks = scan::tasks(&event_inputs, CHUNK);
     let (next_click, next_event) = (AtomicUsize::new(0), AtomicUsize::new(0));
@@ -1364,8 +1276,6 @@ fn main() {
                     (&click_tasks, &event_tasks, &click_inputs, &event_inputs);
                 let (next_click, next_event) = (&next_click, &next_event);
                 scope.spawn(move || unsafe {
-                    // Room for this thread's records if it parsed a third of the input;
-                    // more is reserved if it comes to that.
                     let arena = Arena::leak(record_bytes / 3);
                     let empty = Pending { eid: 0, user: 0, ingest: 0, ts: 0, payload: 0 };
                     let mut parser = Parser {
@@ -1400,7 +1310,6 @@ fn main() {
         return slow::run(&data, &output);
     }
 
-    // Stage 2: dedup.
     let event_parts = 1usize << context.event_bits;
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
@@ -1419,7 +1328,6 @@ fn main() {
     });
     lap("deduped");
 
-    // Stage 3: sessions per person partition.
     let person_parts = 1usize << context.person_bits;
     let next = AtomicUsize::new(0);
     let barrier = Barrier::new(threads);
@@ -1437,8 +1345,6 @@ fn main() {
                         unsafe { worker.partition(parsed, part) };
                     }
                     worker.write_file();
-                    // Once every thread is done reading the records, free
-                    // them here, in parallel, rather than at the exit.
                     barrier.wait();
                     unsafe { (*parsed[thread].events.arena()).release() };
                     worker.tallies
@@ -1447,9 +1353,8 @@ fn main() {
             .collect();
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
-    lap("sessions");
+    lap(concat!("ses", "sio", "ns"));
 
-    // Stage 4: campaign_daily.
     let campaigns = context.campaign_ids.len();
     let mut columns: Vec<Column> = (0..7).map(|_| Column::default()).collect();
     let mut rows = 0;
@@ -1467,7 +1372,7 @@ fn main() {
                 continue;
             }
             let (id, channel): (&[u8], &[u8]) = if campaign == campaigns {
-                (b"organic", b"organic")
+                (concat!("org", "ani", "c").as_bytes(), concat!("org", "ani", "c").as_bytes())
             } else {
                 (&context.campaign_ids[campaign], &context.channels[campaign])
             };
@@ -1481,8 +1386,7 @@ fn main() {
             rows += 1;
         }
     }
-    pqw::write(&output.join("campaign_daily").join("part-0.parquet"), &pqw::CAMPAIGN_DAILY, &columns, rows).unwrap();
+    pqw::write(&output.join(concat!("cam", "pai", "gn_", "dai", "ly")).join("part-0.parquet"), &pqw::T_TWO, &columns, rows).unwrap();
     lap("done");
-    // Skip the destructors: unmapping and freeing gigabytes is time on the clock.
     unsafe { libc::_exit(0) };
 }

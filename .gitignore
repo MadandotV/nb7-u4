@@ -1,7 +1,1 @@
 /target
-/data
-/out*
-/dl
-/vendor
-*.parquet
-/.venv
