@@ -1,0 +1,26 @@
+[package]
+name = "shopsess"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "shopsess"
+path = "src/main.rs"
+
+[[bin]]
+name = "reference"
+path = "src/bin/reference.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
