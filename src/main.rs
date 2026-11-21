@@ -639,7 +639,9 @@ struct Pending {
     payload: u32,
 }
 
-const RING: usize = 16;
+/// Lines wait this many to a batch for their person, whose table slot is
+/// fetched meanwhile.
+const RING: usize = 32;
 
 struct Parser<'a> {
     context: &'a Context,
@@ -714,12 +716,12 @@ impl<'a> Parser<'a> {
             }
             let user = keys::pack(user, user_len);
             self.links.prefetch(user);
-            let slot = self.pending_count % RING;
-            if self.pending_count >= RING {
-                self.finish_event(self.pending[slot]);
-            }
-            self.pending[slot] = Pending { eid, user, ingest: seconds, ts: (ts - context.window_start) as u32, payload };
+            *self.pending.get_unchecked_mut(self.pending_count) =
+                Pending { eid, user, ingest: seconds, ts: (ts - context.window_start) as u32, payload };
             self.pending_count += 1;
+            if self.pending_count == RING {
+                self.finish_events();
+            }
             return;
         }
         let part = (keys::hash(eid) >> (64 - context.event_bits)) as usize;
@@ -750,22 +752,34 @@ impl<'a> Parser<'a> {
         }
         let user = keys::pack(user, user_len);
         self.links.prefetch(user);
-        let slot = self.pending_click_count % RING;
-        if self.pending_click_count >= RING {
-            self.finish_click(self.pending_clicks[slot]);
-        }
-        self.pending_clicks[slot] =
+        *self.pending_clicks.get_unchecked_mut(self.pending_click_count) =
             Ck { person: user, id: keys::pack(id, id_len), ts: (ts - context.click_start) as u32, campaign };
         self.pending_click_count += 1;
+        if self.pending_click_count == RING {
+            self.finish_clicks();
+        }
     }
 
-    unsafe fn finish(&mut self) {
-        for slot in 0..self.pending_count.min(RING) {
+    #[inline(never)]
+    unsafe fn finish_events(&mut self) {
+        for slot in 0..self.pending_count {
             self.finish_event(self.pending[slot]);
         }
-        for slot in 0..self.pending_click_count.min(RING) {
+        self.pending_count = 0;
+    }
+
+    #[inline(never)]
+    unsafe fn finish_clicks(&mut self) {
+        for slot in 0..self.pending_click_count {
             self.finish_click(self.pending_clicks[slot]);
         }
+        self.pending_click_count = 0;
+    }
+
+
+    unsafe fn finish(&mut self) {
+        self.finish_events();
+        self.finish_clicks();
         self.dedups.finish();
         self.events.finish();
         self.clicks.finish();
