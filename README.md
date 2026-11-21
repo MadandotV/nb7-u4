@@ -5,15 +5,28 @@ become the two daily Parquet tables in `/output`, as `rules.md` defines them.
 
 It is one Rust binary with no engine underneath.
 
-- `src/main.rs`: the pipeline that is timed. It scans the CSVs with AVX2,
-  dedups events by ID, joins linked IDs with a union-find, groups events and
-  clicks by person, sessionizes, credits and assists, and writes Parquet.
+- `src/main.rs`: the pipeline that is timed. Links are joined first, in a
+  lock-free hash table and union-find. Events and clicks are then parsed once:
+  every event line leaves a 16-byte dedup record partitioned by event ID, and
+  every valid event and click a record partitioned by person. Each event-ID
+  partition is deduped and the losing copies tombstoned; each person partition
+  is grouped, sorted, sessionized, credited and written out.
+- `src/scan.rs`: memory-mapped input and the AVX2 pass that indexes the
+  separators and quotes of a block of lines.
+- `src/mem.rs`: the partitioned record streams, filled a cache line at a time.
+- `src/keys.rs`: IDs as exact 64-bit keys.
+- `src/pqw.rs`: a small Parquet writer (uncompressed, PLAIN pages).
 - `src/slow.rs`: a plain single-threaded implementation that follows
   `rules.md` line by line. The fast pipeline is checked against it, and falls
   back to it for input it does not represent exactly (for example a window
   months long).
-- `src/pqw.rs`: a small Parquet writer (uncompressed, PLAIN pages).
-- `src/keys.rs`: IDs as exact 64-bit keys.
+
+## Check it
+
+- `check.sh DATASET` runs both implementations on a dataset and diffs the tables.
+- `tests/fuzz.py ROUNDS` does the same on small random datasets full of
+  quoting, malformed lines, bad timestamps and odd IDs.
+- `bench.sh BINARY DATASET` times repeated runs.
 
 ## Run it
 

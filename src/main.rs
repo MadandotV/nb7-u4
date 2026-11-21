@@ -253,7 +253,6 @@ unsafe fn number(at: *const u8, len: usize) -> Option<u64> {
 // ---------------------------------------------------------------- context
 
 struct Context {
-    threads: usize,
     window_start: i64,
     window_end: i64,
     /// `window_start - 7 days`.
@@ -332,7 +331,7 @@ impl Context {
     }
 }
 
-fn load_context(data: &Path, event_bytes: u64, threads: usize) -> Option<Context> {
+fn load_context(data: &Path) -> Option<Context> {
     let (window_start, window_end) = slow::manifest(&data.join("manifest.json"));
     if window_end <= window_start || window_end - window_start + WEEK >= 1 << 31 {
         return None;
@@ -397,10 +396,7 @@ fn load_context(data: &Path, event_bytes: u64, threads: usize) -> Option<Context
     }
 
     let first_day = window_start.div_euclid(DAY);
-    let estimate = event_bytes / 80;
-    let bits = |per: u64, most: u32| (estimate / per).max(1).next_power_of_two().trailing_zeros().clamp(4, most);
     Some(Context {
-        threads,
         window_start,
         window_end,
         click_start: window_start - WEEK,
@@ -416,8 +412,8 @@ fn load_context(data: &Path, event_bytes: u64, threads: usize) -> Option<Context
         channels,
         campaign_by_number,
         campaign_by_name,
-        event_bits: bits(20_000, 11),
-        person_bits: bits(40_000, 11),
+        event_bits: 0,
+        person_bits: 0,
     })
 }
 
@@ -427,7 +423,8 @@ fn load_context(data: &Path, event_bytes: u64, threads: usize) -> Option<Context
 ///
 /// While the links are joined a value is 0 for the root of a union-find
 /// tree, or `(parent slot + 1) << 4 | 1`: no ID key ends in the nibble 1.
-/// Afterwards every value is the person's name.
+/// A root is the smallest ID of its tree. Afterwards every value is the
+/// person's name.
 struct Links {
     slots: *const [AtomicU64; 2],
     mask: usize,
@@ -533,10 +530,12 @@ impl Links {
             if a == b {
                 return;
             }
-            // The higher slot goes under the lower, so no cycle can form.
-            let (high, low) = if a > b { (a, b) } else { (b, a) };
-            let pointer = ((low as u64 + 1) << 4) | 1;
-            if self.value(high).compare_exchange(0, pointer, Relaxed, Relaxed).is_ok() {
+            // The root with the larger ID goes under the other, so a tree's
+            // root holds its smallest ID, and no cycle can form.
+            let smaller = keys::compare(self.key(a).load(Relaxed), self.key(b).load(Relaxed)).is_lt();
+            let (under, over) = if smaller { (b, a) } else { (a, b) };
+            let pointer = ((over as u64 + 1) << 4) | 1;
+            if self.value(under).compare_exchange(0, pointer, Relaxed, Relaxed).is_ok() {
                 return;
             }
         }
@@ -558,7 +557,7 @@ fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>]) -> Links {
         .collect();
     const RANGES: usize = 256;
     let range = capacity.div_ceil(RANGES);
-    let (next_job, next_name, next_fill) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let (next_job, next_fill) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let barrier = Barrier::new(threads);
     std::thread::scope(|scope| {
         for _ in 0..threads {
@@ -584,36 +583,8 @@ fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>]) -> Links {
                     }
                 }
                 barrier.wait();
-                // Give each root the smallest ID under it.
-                loop {
-                    let from = next_name.fetch_add(1, Relaxed) * range;
-                    if from >= capacity {
-                        break;
-                    }
-                    let to = (from + range).min(capacity);
-                    for at in from..to {
-                        if at % 16 == 0 {
-                            for ahead in at + 16..(at + 32).min(to) {
-                                links.prefetch_parent(ahead);
-                            }
-                        }
-                        let user = links.key(at).load(Relaxed);
-                        if user == 0 {
-                            continue;
-                        }
-                        let name = links.value(links.root(at));
-                        let mut current = name.load(Relaxed);
-                        while current == 0 || keys::compare(user, current).is_lt() {
-                            match name.compare_exchange(current, user, Relaxed, Relaxed) {
-                                Ok(_) => break,
-                                Err(actual) => current = actual,
-                            }
-                        }
-                    }
-                }
-                barrier.wait();
-                // And every other ID its root's name. A slot already given
-                // its name ends the walk like a root: it is the same name.
+                // Every ID gets its root's ID, the person's name. A slot
+                // that already has its name ends the walk like a root does.
                 loop {
                     let from = next_fill.fetch_add(1, Relaxed) * range;
                     if from >= capacity {
@@ -626,14 +597,18 @@ fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>]) -> Links {
                                 links.prefetch_parent(ahead);
                             }
                         }
-                        let mut value = links.value(at).load(Relaxed);
-                        if links.key(at).load(Relaxed) == 0 || !is_pointer(value) {
+                        let key = links.key(at).load(Relaxed);
+                        if key == 0 {
                             continue;
                         }
+                        let mut value = links.value(at).load(Relaxed);
+                        let mut name = key;
                         while is_pointer(value) {
-                            value = links.value((value >> 4) as usize - 1).load(Relaxed);
+                            let up = (value >> 4) as usize - 1;
+                            name = links.key(up).load(Relaxed);
+                            value = links.value(up).load(Relaxed);
                         }
-                        links.value(at).store(value, Relaxed);
+                        links.value(at).store(if value == 0 { name } else { value }, Relaxed);
                     }
                 }
             });
@@ -1262,8 +1237,15 @@ fn main() {
         }
     };
 
-    fs::create_dir_all(output.join("user_daily")).unwrap();
-    fs::create_dir_all(output.join("campaign_daily")).unwrap();
+    // The small files load on a thread of their own while the links are joined.
+    let context = {
+        let (data, output) = (data.clone(), output.clone());
+        std::thread::spawn(move || {
+            fs::create_dir_all(output.join("user_daily")).unwrap();
+            fs::create_dir_all(output.join("campaign_daily")).unwrap();
+            load_context(&data)
+        })
+    };
 
     let open_all = |folder: &str| -> Vec<Input> { csv_files(&data.join(folder)).iter().map(|path| scan::open(path)).collect() };
     let link_inputs = open_all("links");
@@ -1272,11 +1254,11 @@ fn main() {
     let event_bytes: u64 = event_inputs.iter().map(Input::len).sum();
     lap("opened");
 
-    // Stage 0: links, while this thread reads the small files.
+    // Stage 0: links.
     const CHUNK: usize = 1 << 19;
     let link_tasks = scan::tasks(&link_inputs, CHUNK);
     let next = AtomicUsize::new(0);
-    let (context, pairs) = std::thread::scope(|scope| {
+    let pairs: Vec<Vec<(u64, u64)>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {
@@ -1293,18 +1275,21 @@ fn main() {
                 })
             })
             .collect();
-        let context = load_context(&data, event_bytes, threads);
-        let pairs: Vec<Vec<(u64, u64)>> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
-        (context, pairs)
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
-    let Some(context) = context else {
-        return slow::run(&data, &output);
-    };
-    let context = &context;
     lap("links parsed");
     let links = build_links(threads, &pairs);
     let links = &links;
     lap("links joined");
+    let Some(mut context) = context.join().unwrap() else {
+        return slow::run(&data, &output);
+    };
+    let estimate = event_bytes / 80;
+    let bits = |per: u64, most: u32| (estimate / per).max(1).next_power_of_two().trailing_zeros().clamp(4, most);
+    context.event_bits = bits(40_000, 11);
+    context.person_bits = bits(20_000, 11);
+    let context = &context;
+    lap("context");
 
     // Stage 1: events and clicks.
     let click_tasks = scan::tasks(&click_inputs, CHUNK);
