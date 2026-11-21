@@ -25,7 +25,7 @@ use std::sync::Barrier;
 use std::time::Instant;
 
 use mem::{Arena, Scatter};
-use scan::{Index, Input};
+use scan::{Buffer, Field, Input};
 use shopsess::keys;
 use shopsess::pqw::{self, Column, Kind, Spec};
 use shopsess::slow;
@@ -422,9 +422,8 @@ fn load_context(data: &Path) -> Option<Context> {
 /// User ID to person, as an open-addressing table of `[user, value]`.
 ///
 /// While the links are joined a value is 0 for the root of a union-find
-/// tree, or `(parent slot + 1) << 4 | 1`: no ID key ends in the nibble 1.
-/// A root is the smallest ID of its tree. Afterwards every value is the
-/// person's name.
+/// tree, or its parent's slot plus 1, which is below every ID key. A root is
+/// the smallest ID of its tree. Afterwards every value is the person's name.
 struct Links {
     slots: *const [AtomicU64; 2],
     mask: usize,
@@ -434,7 +433,7 @@ unsafe impl Sync for Links {}
 
 #[inline(always)]
 fn is_pointer(value: u64) -> bool {
-    value & 15 == 1
+    value != 0 && value < keys::SMALLEST
 }
 
 impl Links {
@@ -483,7 +482,7 @@ impl Links {
     fn prefetch_parent(&self, at: usize) {
         let value = self.value(at).load(Relaxed);
         if is_pointer(value) {
-            unsafe { _mm_prefetch(self.slots.add((value >> 4) as usize - 1) as *const i8, _MM_HINT_T0) };
+            unsafe { _mm_prefetch(self.slots.add(value as usize - 1) as *const i8, _MM_HINT_T0) };
         }
     }
 
@@ -515,7 +514,7 @@ impl Links {
             if !is_pointer(up) {
                 return at;
             }
-            let up_at = (up >> 4) as usize - 1;
+            let up_at = up as usize - 1;
             let above = self.value(up_at).load(Relaxed);
             if is_pointer(above) {
                 self.value(at).store(above, Relaxed);
@@ -534,7 +533,7 @@ impl Links {
             // root holds its smallest ID, and no cycle can form.
             let smaller = keys::compare(self.key(a).load(Relaxed), self.key(b).load(Relaxed)).is_lt();
             let (under, over) = if smaller { (b, a) } else { (a, b) };
-            let pointer = ((over as u64 + 1) << 4) | 1;
+            let pointer = over as u64 + 1;
             if self.value(under).compare_exchange(0, pointer, Relaxed, Relaxed).is_ok() {
                 return;
             }
@@ -604,7 +603,7 @@ fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>]) -> Links {
                         let mut value = links.value(at).load(Relaxed);
                         let mut name = key;
                         while is_pointer(value) {
-                            let up = (value >> 4) as usize - 1;
+                            let up = value as usize - 1;
                             name = links.key(up).load(Relaxed);
                             value = links.value(up).load(Relaxed);
                         }
@@ -619,19 +618,9 @@ fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>]) -> Links {
 
 // ---------------------------------------------------------------- stage 1
 
-/// Field `index` of a line without its wrapping quotes.
 #[inline(always)]
-unsafe fn field(base: *const u8, ends: *const u32, quoted: u64, index: usize) -> (*const u8, usize) {
-    let strip = (quoted >> index) as usize & 1;
-    let from = *ends.add(index) as usize;
-    let to = *ends.add(index + 1) as usize - 1;
-    (base.add(from + strip), to - from - 2 * strip)
-}
-
-#[inline(always)]
-unsafe fn link_line(out: &mut Vec<(u64, u64)>, base: *const u8, ends: *const u32, quoted: u64) {
-    let (a, a_len) = field(base, ends, quoted, 0);
-    let (b, b_len) = field(base, ends, quoted, 1);
+unsafe fn link_line(out: &mut Vec<(u64, u64)>, fields: &[Field; 2]) {
+    let [(a, a_len), (b, b_len)] = *fields;
     if a_len == 0 || b_len == 0 {
         return;
     }
@@ -681,15 +670,10 @@ impl<'a> Parser<'a> {
     }
 
     #[inline(always)]
-    unsafe fn event_line(&mut self, base: *const u8, ends: *const u32, quoted: u64) {
+    unsafe fn event_line(&mut self, fields: &[Field; 7]) {
         let context = self.context;
-        let (id, id_len) = field(base, ends, quoted, 0);
-        let (user, user_len) = field(base, ends, quoted, 1);
-        let (ts, ts_len) = field(base, ends, quoted, 2);
-        let (ingest, ingest_len) = field(base, ends, quoted, 3);
-        let (kind, kind_len) = field(base, ends, quoted, 4);
-        let (product, product_len) = field(base, ends, quoted, 5);
-        let (price, price_len) = field(base, ends, quoted, 6);
+        let [(id, id_len), (user, user_len), (ts, ts_len), (ingest, ingest_len), (kind, kind_len), (product, product_len), (price, price_len)] =
+            *fields;
         if id_len == 0 {
             return;
         }
@@ -750,12 +734,9 @@ impl<'a> Parser<'a> {
     }
 
     #[inline(always)]
-    unsafe fn click_line(&mut self, base: *const u8, ends: *const u32, quoted: u64) {
+    unsafe fn click_line(&mut self, fields: &[Field; 4]) {
         let context = self.context;
-        let (id, id_len) = field(base, ends, quoted, 0);
-        let (user, user_len) = field(base, ends, quoted, 1);
-        let (campaign, campaign_len) = field(base, ends, quoted, 2);
-        let (ts, ts_len) = field(base, ends, quoted, 3);
+        let [(id, id_len), (user, user_len), (campaign, campaign_len), (ts, ts_len)] = *fields;
         if id_len == 0 || user_len == 0 {
             return;
         }
@@ -985,6 +966,8 @@ impl<'a> Worker<'a> {
         self.keys.resize(capacity, 0);
         self.ids.resize(capacity, 0);
         self.people.clear();
+        let days = self.context.days;
+        let day_offset = self.context.day_offset;
         self.counts.clear();
         self.owner.clear();
         for thread in parsed {
@@ -1004,18 +987,21 @@ impl<'a> Worker<'a> {
                             let id = self.people.len() as u32;
                             *self.ids.get_unchecked_mut(at) = id;
                             self.people.push(event.person);
-                            self.counts.push(0);
+                            self.counts.resize(self.counts.len() + days, 0);
                             break id;
                         }
                         at = (at + 1) & mask;
                     };
-                    *self.counts.get_unchecked_mut(id as usize) += 1;
-                    self.owner.push(id);
+                    // Events are counted, then placed, by person and day, so
+                    // that only a day's worth is left to sort at a time.
+                    let cell = id * days as u32 + ((day_offset + u64::from(event.ts)) / DAY as u64) as u32;
+                    *self.counts.get_unchecked_mut(cell as usize) += 1;
+                    self.owner.push(cell);
                 }
             });
         }
         let people = self.people.len();
-        // counts[p] becomes where person p's events end, then where they start.
+        // counts[cell] becomes where the cell's events end, then where they start.
         let mut sum = 0;
         for count in &mut self.counts {
             sum += *count;
@@ -1090,7 +1076,7 @@ impl<'a> Worker<'a> {
         self.click_counts.push(click_total as u32);
 
         for person in 0..people {
-            let events = self.counts[person] as usize..self.counts[person + 1] as usize;
+            let events = self.counts[person * days] as usize..self.counts[(person + 1) * days] as usize;
             let clicks = self.click_counts[person] as usize..self.click_counts[person + 1] as usize;
             self.person(person, events, clicks);
         }
@@ -1102,8 +1088,24 @@ impl<'a> Worker<'a> {
         let organic = self.context.campaign_ids.len();
         let events = unsafe { std::slice::from_raw_parts_mut(self.events.as_mut_ptr().add(events.start), events.len()) };
         let clicks = unsafe { std::slice::from_raw_parts_mut(self.clicks.as_mut_ptr().add(clicks.start), clicks.len()) };
-        if events.len() > 1 {
-            events.sort_unstable();
+        // The events are already in day order; sort within each day.
+        for day in 0..days {
+            let from = (self.counts[person * days + day] - self.counts[person * days]) as usize;
+            let to = (self.counts[person * days + day + 1] - self.counts[person * days]) as usize;
+            let slice = &mut events[from..to];
+            if slice.len() > 32 {
+                slice.sort_unstable();
+            } else {
+                for at in 1..slice.len() {
+                    let value = slice[at];
+                    let mut hole = at;
+                    while hole > 0 && slice[hole - 1] > value {
+                        slice[hole] = slice[hole - 1];
+                        hole -= 1;
+                    }
+                    slice[hole] = value;
+                }
+            }
         }
         if clicks.len() > 1 {
             clicks.sort_unstable_by_key(|click| click.ts);
@@ -1255,7 +1257,7 @@ fn main() {
     lap("opened");
 
     // Stage 0: links.
-    const CHUNK: usize = 1 << 19;
+    const CHUNK: usize = 1 << 18;
     let link_tasks = scan::tasks(&link_inputs, CHUNK);
     let next = AtomicUsize::new(0);
     let pairs: Vec<Vec<(u64, u64)>> = std::thread::scope(|scope| {
@@ -1263,12 +1265,10 @@ fn main() {
             .map(|_| {
                 scope.spawn(|| {
                     let mut out = Vec::new();
-                    let mut index = Index::new();
+                    let mut buffer = Buffer::new();
                     while let Some(&task) = link_tasks.get(next.fetch_add(1, Relaxed)) {
                         unsafe {
-                            scan::run::<2>(&link_inputs[task.file], task, &mut index, |base, ends, quoted| {
-                                link_line(&mut out, base, ends, quoted)
-                            });
+                            scan::run::<2>(&link_inputs[task.file], task, &mut buffer, |fields| link_line(&mut out, fields));
                         }
                     }
                     out
@@ -1317,16 +1317,12 @@ fn main() {
                         pending_clicks: [Ck { person: 0, id: 0, ts: 0, campaign: 0 }; RING],
                         pending_click_count: 0,
                     };
-                    let mut index = Index::new();
+                    let mut buffer = Buffer::new();
                     while let Some(&task) = event_tasks.get(next_event.fetch_add(1, Relaxed)) {
-                        scan::run::<7>(&event_inputs[task.file], task, &mut index, |base, ends, quoted| {
-                            parser.event_line(base, ends, quoted)
-                        });
+                        scan::run::<7>(&event_inputs[task.file], task, &mut buffer, |fields| parser.event_line(fields));
                     }
                     while let Some(&task) = click_tasks.get(next_click.fetch_add(1, Relaxed)) {
-                        scan::run::<4>(&click_inputs[task.file], task, &mut index, |base, ends, quoted| {
-                            parser.click_line(base, ends, quoted)
-                        });
+                        scan::run::<4>(&click_inputs[task.file], task, &mut buffer, |fields| parser.click_line(fields));
                     }
                     parser.finish();
                     Parsed { dedups: parser.dedups, events: parser.events, clicks: parser.clicks }
