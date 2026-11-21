@@ -22,23 +22,37 @@ pub fn zeroed(bytes: usize, populate: bool) -> *mut u8 {
     }
 }
 
+/// A thread's bump allocator. It reserves address space once, so that
+/// growing it never takes the process-wide lock that `mmap` does, and maps
+/// the pages a step at a time just ahead of their use.
 pub struct Arena {
     at: *mut u8,
+    /// Pages before this are mapped.
+    mapped: *mut u8,
     end: *mut u8,
     regions: Vec<(*mut u8, usize)>,
+    reserve: usize,
 }
 
-const REGION: usize = 8 << 20;
+const STEP: usize = 2 << 20;
 
 impl Arena {
-    pub fn leak() -> *mut Arena {
-        Box::leak(Box::new(Arena { at: std::ptr::null_mut(), end: std::ptr::null_mut(), regions: Vec::new() }))
+    /// `reserve` is how much address space to set aside at a time.
+    pub fn leak(reserve: usize) -> *mut Arena {
+        Box::leak(Box::new(Arena {
+            at: std::ptr::null_mut(),
+            mapped: std::ptr::null_mut(),
+            end: std::ptr::null_mut(),
+            regions: Vec::new(),
+            reserve: reserve.max(STEP).next_multiple_of(STEP),
+        }))
     }
 
     /// Gives the memory back. Nothing may use it afterwards.
     pub unsafe fn release(&mut self) {
-        for &(at, size) in &self.regions {
-            libc::madvise(at as *mut libc::c_void, size, libc::MADV_DONTNEED);
+        for &(at, _) in &self.regions {
+            let used = if at == self.regions.last().unwrap().0 { self.mapped as usize - at as usize } else { self.reserve };
+            libc::madvise(at as *mut libc::c_void, used, libc::MADV_DONTNEED);
         }
     }
 
@@ -47,13 +61,19 @@ impl Arena {
     pub unsafe fn alloc(&mut self, bytes: usize) -> *mut u8 {
         let bytes = (bytes + 63) & !63;
         if (self.end as usize) - (self.at as usize) < bytes {
-            let size = bytes.max(REGION);
-            self.at = zeroed(size, true);
-            self.end = self.at.add(size);
-            self.regions.push((self.at, size));
+            self.reserve = self.reserve.max(bytes.next_multiple_of(STEP));
+            self.at = zeroed(self.reserve, false);
+            self.mapped = self.at;
+            self.end = self.at.add(self.reserve);
+            self.regions.push((self.at, self.reserve));
         }
         let out = self.at;
         self.at = self.at.add(bytes);
+        while self.mapped < self.at {
+            // Without this call the pages are mapped one fault at a time, which is slower but works.
+            libc::madvise(self.mapped as *mut libc::c_void, STEP, libc::MADV_POPULATE_WRITE);
+            self.mapped = self.mapped.add(STEP);
+        }
         out
     }
 }

@@ -1291,6 +1291,8 @@ fn main() {
     let context = &context;
     lap("context");
 
+    // About 32 bytes of records for each event line and 24 for each click.
+    let record_bytes = (event_bytes / 2 + click_inputs.iter().map(Input::len).sum::<u64>()) as usize;
     // Stage 1: events and clicks.
     let click_tasks = scan::tasks(&click_inputs, CHUNK);
     let event_tasks = scan::tasks(&event_inputs, CHUNK);
@@ -1302,7 +1304,9 @@ fn main() {
                     (&click_tasks, &event_tasks, &click_inputs, &event_inputs);
                 let (next_click, next_event) = (&next_click, &next_event);
                 scope.spawn(move || unsafe {
-                    let arena = Arena::leak();
+                    // Room for this thread's records if it parsed a third of the input;
+                    // more is reserved if it comes to that.
+                    let arena = Arena::leak(record_bytes / 3);
                     let empty = Pending { eid: 0, user: 0, ingest: 0, ts: 0, payload: 0 };
                     let mut parser = Parser {
                         context,
