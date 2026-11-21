@@ -872,10 +872,29 @@ struct Worker<'a> {
     active: Vec<u32>,
     active_count: Vec<u32>,
     active_at: Vec<u32>,
+    // One person's events by half-hour bucket: the buckets, which of them
+    // have events, those in order, and the purchases, chained per bucket.
+    cells: Vec<Cell>,
+    touched: Vec<u64>,
+    order: Vec<u32>,
+    purchases: Vec<(u32, u32)>,
     // Purchases by category for the current row.
     category_sum: Vec<i64>,
     category_used: Vec<u32>,
 }
+
+/// The events of one person in one half-hour bucket.
+#[derive(Clone, Copy)]
+struct Cell {
+    first: u32,
+    last: u32,
+    count: u32,
+    /// The bucket's latest purchase in `purchases`, each naming the one before it.
+    purchases: u32,
+    revenue: i64,
+}
+
+const NO_PURCHASE: u32 = u32::MAX;
 
 struct Row {
     day: usize,
@@ -906,6 +925,10 @@ impl<'a> Worker<'a> {
             active: Vec::new(),
             active_count: vec![0; campaigns],
             active_at: vec![0; campaigns],
+            cells: vec![Cell { first: 0, last: 0, count: 0, purchases: NO_PURCHASE, revenue: 0 }; context.days * (DAY as u64 / GAP) as usize],
+            touched: vec![0; (context.days * (DAY as u64 / GAP) as usize).div_ceil(64)],
+            order: Vec::new(),
+            purchases: Vec::new(),
             category_sum: vec![0; context.categories.len()],
             category_used: Vec::new(),
         }
@@ -966,8 +989,6 @@ impl<'a> Worker<'a> {
         self.keys.resize(capacity, 0);
         self.ids.resize(capacity, 0);
         self.people.clear();
-        let days = self.context.days;
-        let day_offset = self.context.day_offset;
         self.counts.clear();
         self.owner.clear();
         for thread in parsed {
@@ -987,21 +1008,18 @@ impl<'a> Worker<'a> {
                             let id = self.people.len() as u32;
                             *self.ids.get_unchecked_mut(at) = id;
                             self.people.push(event.person);
-                            self.counts.resize(self.counts.len() + days, 0);
+                            self.counts.push(0);
                             break id;
                         }
                         at = (at + 1) & mask;
                     };
-                    // Events are counted, then placed, by person and day, so
-                    // that only a day's worth is left to sort at a time.
-                    let cell = id * days as u32 + ((day_offset + u64::from(event.ts)) / DAY as u64) as u32;
-                    *self.counts.get_unchecked_mut(cell as usize) += 1;
-                    self.owner.push(cell);
+                    *self.counts.get_unchecked_mut(id as usize) += 1;
+                    self.owner.push(id);
                 }
             });
         }
         let people = self.people.len();
-        // counts[cell] becomes where the cell's events end, then where they start.
+        // counts[p] becomes where person p's events end, then where they start.
         let mut sum = 0;
         for count in &mut self.counts {
             sum += *count;
@@ -1076,7 +1094,7 @@ impl<'a> Worker<'a> {
         self.click_counts.push(click_total as u32);
 
         for person in 0..people {
-            let events = self.counts[person * days] as usize..self.counts[(person + 1) * days] as usize;
+            let events = self.counts[person] as usize..self.counts[person + 1] as usize;
             let clicks = self.click_counts[person] as usize..self.click_counts[person + 1] as usize;
             self.person(person, events, clicks);
         }
@@ -1088,23 +1106,37 @@ impl<'a> Worker<'a> {
         let organic = self.context.campaign_ids.len();
         let events = unsafe { std::slice::from_raw_parts_mut(self.events.as_mut_ptr().add(events.start), events.len()) };
         let clicks = unsafe { std::slice::from_raw_parts_mut(self.clicks.as_mut_ptr().add(clicks.start), clicks.len()) };
-        // The events are already in day order; sort within each day.
-        for day in 0..days {
-            let from = (self.counts[person * days + day] - self.counts[person * days]) as usize;
-            let to = (self.counts[person * days + day + 1] - self.counts[person * days]) as usize;
-            let slice = &mut events[from..to];
-            if slice.len() > 32 {
-                slice.sort_unstable();
+        // Events less than the session gap apart share a session, so nothing
+        // within a half-hour bucket needs ordering: a bucket's earliest and
+        // latest times, its count and its purchases say all a session needs.
+        let day_offset = self.context.day_offset;
+        for &event in events.iter() {
+            let ts = (event >> 32) as u32;
+            let bucket = ((day_offset + u64::from(ts)) / GAP) as usize;
+            let (word, bit) = (bucket >> 6, 1u64 << (bucket & 63));
+            let cell = unsafe { self.cells.get_unchecked_mut(bucket) };
+            if unsafe { *self.touched.get_unchecked(word) } & bit == 0 {
+                unsafe { *self.touched.get_unchecked_mut(word) |= bit };
+                *cell = Cell { first: ts, last: ts, count: 1, purchases: NO_PURCHASE, revenue: 0 };
             } else {
-                for at in 1..slice.len() {
-                    let value = slice[at];
-                    let mut hole = at;
-                    while hole > 0 && slice[hole - 1] > value {
-                        slice[hole] = slice[hole - 1];
-                        hole -= 1;
-                    }
-                    slice[hole] = value;
-                }
+                cell.first = cell.first.min(ts);
+                cell.last = cell.last.max(ts);
+                cell.count += 1;
+            }
+            let payload = event as u32;
+            if payload & 0x00FF_FFFF != 0 {
+                cell.revenue += i64::from(payload & 0x00FF_FFFF);
+                self.purchases.push((cell.purchases, payload));
+                cell.purchases = self.purchases.len() as u32 - 1;
+            }
+        }
+        // The buckets with events, in time order.
+        self.order.clear();
+        for word in 0..self.touched.len() {
+            let mut bits = std::mem::take(&mut self.touched[word]);
+            while bits != 0 {
+                self.order.push((word * 64) as u32 + bits.trailing_zeros());
+                bits &= bits - 1;
             }
         }
         if clicks.len() > 1 {
@@ -1114,9 +1146,10 @@ impl<'a> Worker<'a> {
         // Clicks `low..high` are those in the 7 days up to the session's start.
         let (mut low, mut high) = (0, 0);
         let mut at = 0;
-        while at < events.len() {
-            let start = events[at] >> 32;
-            let day = ((self.context.day_offset + start) / DAY as u64) as usize;
+        while at < self.order.len() {
+            let bucket = self.order[at] as usize;
+            let start = u64::from(self.cells[bucket].first);
+            let day = bucket / (DAY as u64 / GAP) as usize;
             if day != row.day {
                 if row.day != usize::MAX {
                     self.emit(name, &row);
@@ -1124,27 +1157,30 @@ impl<'a> Worker<'a> {
                 row = Row { day, sessions: 0, events: 0, revenue: 0 };
             }
             let mut revenue = 0i64;
+            let mut count = 0u32;
             let mut last = start;
-            let first = at;
-            while at < events.len() {
-                let ts = events[at] >> 32;
-                if ts - last > GAP {
+            while at < self.order.len() {
+                let cell = self.cells[self.order[at] as usize];
+                if u64::from(cell.first) - last > GAP {
                     break;
                 }
-                last = ts;
-                let price = events[at] as u32 & 0x00FF_FFFF;
-                if price != 0 {
-                    let category = (events[at] as u32 >> 24) as usize;
-                    revenue += i64::from(price);
+                last = u64::from(cell.last);
+                count += cell.count;
+                revenue += cell.revenue;
+                let mut purchase = cell.purchases;
+                while purchase != NO_PURCHASE {
+                    let (next, payload) = self.purchases[purchase as usize];
+                    let category = (payload >> 24) as usize;
                     if self.category_sum[category] == 0 {
                         self.category_used.push(category as u32);
                     }
-                    self.category_sum[category] += i64::from(price);
+                    self.category_sum[category] += i64::from(payload & 0x00FF_FFFF);
+                    purchase = next;
                 }
                 at += 1;
             }
             row.sessions += 1;
-            row.events += (at - first) as u32;
+            row.events += count;
             row.revenue += revenue;
 
             // In click time the session starts at `start + 7 days`.
@@ -1194,6 +1230,7 @@ impl<'a> Worker<'a> {
         if row.day != usize::MAX {
             self.emit(name, &row);
         }
+        self.purchases.clear();
         for &campaign in &self.active {
             self.active_count[campaign as usize] = 0;
         }
