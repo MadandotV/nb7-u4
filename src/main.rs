@@ -1,10 +1,10 @@
 //! The fast pipeline. Stages, each on every core:
 //!
-//! 1. Parse: scan the CSVs with AVX2, turn each event line into a 32-byte
-//!    record partitioned by a hash of its event ID, and each valid click into
-//!    a record. Links are parsed first and joined on one thread meanwhile.
-//! 2. Dedup each event partition, name the person of every surviving event
-//!    and click, and partition both by person.
+//! 0. Links: parse, then join in a lock-free hash table and union-find.
+//! 1. Parse events and clicks. Every event line becomes a 16-byte dedup
+//!    record partitioned by event ID; every valid event and click also becomes
+//!    a record partitioned by person.
+//! 2. Dedup each event-ID partition and tombstone the losing copies.
 //! 3. Per person partition: group by person, sort by time, sessionize, credit
 //!    and assist, and write `user_daily`.
 //! 4. Merge the per-thread campaign counters and write `campaign_daily`.
@@ -13,13 +13,19 @@
 //! not whole seconds, a window months long, hundreds of categories) sets
 //! `BAIL`, and the slow implementation in `slow.rs` writes the answer instead.
 
+mod mem;
+mod scan;
+
 use std::arch::x86_64::*;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::Barrier;
 use std::time::Instant;
 
+use mem::{Arena, Scatter};
+use scan::{Index, Input};
 use shopsess::keys;
 use shopsess::pqw::{self, Column, Kind, Spec};
 use shopsess::slow;
@@ -28,8 +34,17 @@ const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: u64 = 1_800_000;
 const BAD: i64 = i64::MIN;
-const VALID: u32 = 1 << 31;
 const NO_CAMPAIGN: u32 = u32::MAX;
+const NO_CATEGORY: u8 = u8::MAX;
+/// An event that lost its dedup.
+const TOMBSTONE: u32 = u32::MAX;
+/// Ingest times are kept in seconds from this long before the window.
+const INGEST_LEAD: i64 = 4 * DAY;
+const INGEST_BITS: u32 = 22;
+const REF_BITS: u32 = 64 - INGEST_BITS;
+const NO_REF: u64 = (1 << REF_BITS) - 1;
+const INDEX_BITS: u32 = 26;
+const PART_BITS: u32 = 12;
 
 static BAIL: AtomicBool = AtomicBool::new(false);
 
@@ -40,17 +55,14 @@ fn bail() {
 
 // ---------------------------------------------------------------- records
 
+/// One event line, for dedup.
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct Rec {
+struct Dedup {
     eid: u64,
-    user: u64,
-    ts: u32,
-    ingest: i32,
-    /// `VALID`, and for a purchase the price in the low 24 bits and the
-    /// category in bits 24 to 30.
-    payload: u32,
-    _pad: u32,
+    /// Ingest seconds in the top 22 bits, then where its `Ev` is: thread (4
+    /// bits), person partition (12), index (26); or `NO_REF` when invalid.
+    meta: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -58,13 +70,13 @@ struct Rec {
 struct Ev {
     person: u64,
     ts: u32,
+    /// For a purchase the price in the low 24 bits and the category above it.
     payload: u32,
 }
 
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Ck {
-    /// The user in stage 1, the person from stage 2 on.
     person: u64,
     id: u64,
     /// Milliseconds since `window_start - 7 days`.
@@ -72,189 +84,18 @@ struct Ck {
     campaign: u32,
 }
 
-// ---------------------------------------------------------------- files
-
-struct Input {
-    base: *const u8,
-    /// Lines in `0..cut` end at least 64 bytes before the end of the file.
-    cut: usize,
-    /// The rest of the file, newline-terminated and padded.
-    tail: Vec<u8>,
-    tail_end: usize,
-}
-
-unsafe impl Sync for Input {}
-unsafe impl Send for Input {}
-
-fn csv_files(folder: &Path) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = fs::read_dir(folder)
-        .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
-        .unwrap_or_default();
-    paths.retain(|path| path.extension().is_some_and(|ext| ext == "csv") && path.is_file());
-    paths
-}
-
-fn open(path: &Path) -> Input {
-    use std::os::fd::AsRawFd;
-    let file = fs::File::open(path).unwrap();
-    let len = file.metadata().unwrap().len() as usize;
-    if len == 0 {
-        return Input { base: std::ptr::null(), cut: 0, tail: vec![b'\n'; 64], tail_end: 0 };
-    }
-    let base = unsafe {
-        libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0)
-    };
-    assert!(base != libc::MAP_FAILED, "mmap failed");
-    let base = base as *const u8;
-    let bytes = unsafe { std::slice::from_raw_parts(base, len) };
-    let mut cut = len.saturating_sub(64);
-    while cut > 0 && bytes[cut - 1] != b'\n' {
-        cut -= 1;
-    }
-    let mut tail = bytes[cut..].to_vec();
-    if tail.last() != Some(&b'\n') {
-        tail.push(b'\n');
-    }
-    let tail_end = tail.len();
-    tail.extend_from_slice(&[b'\n'; 64]);
-    Input { base, cut, tail, tail_end }
-}
-
-#[derive(Clone, Copy)]
-struct Task {
-    file: usize,
-    from: usize,
-    to: usize,
-    tail: bool,
-}
-
-fn tasks(inputs: &[Input], chunk: usize) -> Vec<Task> {
-    let mut out = Vec::new();
-    for (file, input) in inputs.iter().enumerate() {
-        let mut from = 0;
-        while from < input.cut {
-            let to = (from + chunk).min(input.cut);
-            out.push(Task { file, from, to, tail: false });
-            from = to;
-        }
-        if input.tail_end > 0 {
-            out.push(Task { file, from: 0, to: input.tail_end, tail: true });
-        }
-    }
-    out
-}
-
-/// Runs `line` on every line of the task, without the file's header.
-#[inline(always)]
-unsafe fn run_task(input: &Input, task: Task, line: impl FnMut(*const u8, usize, &[usize; 8], usize, u32)) {
-    let (base, mut from, to) = if task.tail {
-        (input.tail.as_ptr(), 0, task.to)
-    } else {
-        // A chunk owns the lines that start in it.
-        let adjust = |at: usize| {
-            if at == 0 || at >= input.cut {
-                return at.min(input.cut);
-            }
-            let mut at = at - 1;
-            while *input.base.add(at) != b'\n' {
-                at += 1;
-            }
-            at + 1
-        };
-        (input.base, adjust(task.from), adjust(task.to))
-    };
-    if from == 0 && (!task.tail || input.cut == 0) {
-        while *base.add(from) != b'\n' {
-            from += 1;
-        }
-        from += 1;
-    }
-    if from < to {
-        scan(base, from, to, line);
-    }
-}
-
-/// Calls `line(base, line_start, ends, fields, quotes)` for each line of
-/// `from..to`, which must be whole lines with 64 readable bytes after `to`.
-/// `ends[k]` is where field `k` ends; `quotes` counts the line's quotes.
-#[inline(always)]
-unsafe fn scan(
-    base: *const u8,
-    from: usize,
-    to: usize,
-    mut line: impl FnMut(*const u8, usize, &[usize; 8], usize, u32),
-) {
-    let newline = _mm256_set1_epi8(b'\n' as i8);
-    let comma = _mm256_set1_epi8(b',' as i8);
-    let quote = _mm256_set1_epi8(b'"' as i8);
-    let mut at = from;
-    let mut line_start = from;
-    let mut fields = 0usize;
-    let mut ends = [0usize; 8];
-    let mut quotes = 0u32;
-    while at < to {
-        let low = _mm256_loadu_si256(base.add(at) as *const __m256i);
-        let high = _mm256_loadu_si256(base.add(at + 32) as *const __m256i);
-        let mask = |needle: __m256i| {
-            u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(low, needle)) as u32)
-                | u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(high, needle)) as u32) << 32
-        };
-        let mut newlines = mask(newline);
-        let mut separators = newlines | mask(comma);
-        let mut quoted = mask(quote);
-        if to - at < 64 {
-            let keep = (1u64 << (to - at)) - 1;
-            newlines &= keep;
-            separators &= keep;
-            quoted &= keep;
-        }
-        while separators != 0 {
-            let offset = separators.trailing_zeros() as usize;
-            let bit = separators & separators.wrapping_neg();
-            *ends.get_unchecked_mut(fields & 7) = at + offset;
-            fields += 1;
-            if newlines & bit != 0 {
-                let before = bit - 1;
-                quotes += (quoted & before).count_ones();
-                quoted &= !before;
-                line(base, line_start, &ends, fields, quotes);
-                line_start = at + offset + 1;
-                fields = 0;
-                quotes = 0;
-            }
-            separators &= separators - 1;
-        }
-        quotes += quoted.count_ones();
-        at += 64;
-    }
-}
-
-/// Field `index` of a line, with its wrapping quotes removed and counted.
-#[inline(always)]
-unsafe fn field(
-    base: *const u8,
-    line_start: usize,
-    ends: &[usize; 8],
-    index: usize,
-    stripped: &mut u32,
-) -> (*const u8, usize) {
-    let from = if index == 0 { line_start } else { ends[index - 1] + 1 };
-    let to = ends[index];
-    if to - from >= 2 && *base.add(from) == b'"' && *base.add(to - 1) == b'"' {
-        *stripped += 2;
-        (base.add(from + 1), to - from - 2)
-    } else {
-        (base.add(from), to - from)
-    }
-}
+type Dedups = Scatter<Dedup, 4>;
+type Events = Scatter<Ev, 4>;
+type Clicks = Scatter<Ck, 8>;
 
 // ---------------------------------------------------------------- timestamps
 
 struct Calendar {
-    year_month: u32,
-    /// Days from the epoch to day 0 of the cached month.
+    /// The `YYYY-MM-` this entry is for, as the eight bytes.
+    prefix: u64,
+    /// Days from the epoch to day 0 of that month.
     days: i64,
-    days_in_month: u32,
+    days_in_month: u64,
 }
 
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -265,49 +106,84 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year - 719_468
 }
 
-/// `YYYY-MM-DDTHH:MM:SS` at `at` as epoch milliseconds, or `BAD`.
+impl Calendar {
+    fn new() -> Self {
+        Calendar { prefix: 0, days: 0, days_in_month: 0 }
+    }
+
+    /// Caches the month of `prefix`, the bytes `YYYY-MM-`; false if they are not that.
+    #[cold]
+    #[inline(never)]
+    fn load(&mut self, prefix: u64) -> bool {
+        let bytes = prefix.to_le_bytes();
+        let digit = |at: usize| bytes[at].is_ascii_digit().then(|| i64::from(bytes[at] - b'0'));
+        let (Some(y1), Some(y2), Some(y3), Some(y4), Some(m1), Some(m2)) =
+            (digit(0), digit(1), digit(2), digit(3), digit(5), digit(6))
+        else {
+            return false;
+        };
+        let (year, month) = (y1 * 1000 + y2 * 100 + y3 * 10 + y4, m1 * 10 + m2);
+        if bytes[4] != b'-' || bytes[7] != b'-' || !(1..=12).contains(&month) {
+            return false;
+        }
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        self.prefix = prefix;
+        self.days = days_from_civil(year, month, 1) - 1;
+        self.days_in_month = match month {
+            4 | 6 | 9 | 11 => 30,
+            2 => 28 + u64::from(leap),
+            _ => 31,
+        };
+        true
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS` at `at` as epoch seconds, or `BAD`.
 #[inline(always)]
 unsafe fn civil(at: *const u8, calendar: &mut Calendar) -> i64 {
-    let a = (at as *const u64).read_unaligned() ^ u64::from_le_bytes(*b"0000-00-");
+    let prefix = (at as *const u64).read_unaligned();
+    if prefix != calendar.prefix && !calendar.load(prefix) {
+        return BAD;
+    }
     let b = (at.add(8) as *const u64).read_unaligned() ^ u64::from_le_bytes(*b"00T00:00");
     let c = u64::from((at.add(16) as *const u32).read_unaligned() & 0x00FF_FFFF) ^ u64::from_le_bytes(*b":00\0\0\0\0\0");
     // A digit byte must be 0 to 9 and a separator byte 0.
     let check = |value: u64, add: u64| ((value.wrapping_add(add)) | value) & 0x8080_8080_8080_8080;
-    if check(a, 0x7F76_767F_7676_7676) | check(b, 0x7676_7F76_767F_7676) | check(c, 0x0000_0000_0076_767F) != 0 {
+    // Byte k of `x * 2561 >> 8` is `10 * x[k] + x[k + 1]`.
+    let (pairs, second) = (b.wrapping_mul(2561) >> 8, c.wrapping_mul(2561) >> 16 & 0xFF);
+    let (day, hour, minute) = (pairs & 0xFF, pairs >> 24 & 0xFF, pairs >> 48 & 0xFF);
+    if check(b, 0x7676_7F76_767F_7676) | check(c, 0x0000_0000_0076_767F) != 0
+        || day.wrapping_sub(1) >= calendar.days_in_month
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
         return BAD;
     }
-    let digit = |value: u64, index: u32| (value >> (8 * index)) as u32 & 0xFF;
-    let year = digit(a, 0) * 1000 + digit(a, 1) * 100 + digit(a, 2) * 10 + digit(a, 3);
-    let month = digit(a, 5) * 10 + digit(a, 6);
-    let day = digit(b, 0) * 10 + digit(b, 1);
-    let hour = digit(b, 3) * 10 + digit(b, 4);
-    let minute = digit(b, 6) * 10 + digit(b, 7);
-    let second = digit(c, 1) * 10 + digit(c, 2);
-    let year_month = year * 16 + month;
-    if year_month != calendar.year_month {
-        if !(1..=12).contains(&month) {
-            return BAD;
-        }
-        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-        calendar.year_month = year_month;
-        calendar.days = days_from_civil(i64::from(year), i64::from(month), 1) - 1;
-        calendar.days_in_month = match month {
-            4 | 6 | 9 | 11 => 30,
-            2 => 28 + u32::from(leap),
-            _ => 31,
-        };
-    }
-    if day == 0 || day > calendar.days_in_month || hour > 23 || minute > 59 || second > 59 {
-        return BAD;
-    }
-    (calendar.days + i64::from(day)) * DAY + i64::from(hour * 3600 + minute * 60 + second) * 1000
+    (calendar.days + day as i64) * 86_400 + (hour * 3600 + minute * 60 + second) as i64
 }
+
+/// Shuffles that right-align the first `len` bytes of a vector, zero-filled.
+static RIGHT_ALIGN: [[u8; 16]; 17] = {
+    let mut table = [[0x80u8; 16]; 17];
+    let mut len = 0;
+    while len <= 16 {
+        let mut at = 0;
+        while at < len {
+            table[len][16 - len + at] = at as u8;
+            at += 1;
+        }
+        len += 1;
+    }
+    table
+};
 
 /// A `ts` field as epoch milliseconds, or `BAD`.
 #[inline(always)]
 unsafe fn timestamp(at: *const u8, len: usize, calendar: &mut Calendar) -> i64 {
     if len == 20 && *at.add(19) == b'Z' {
-        return civil(at, calendar);
+        let seconds = civil(at, calendar);
+        return if seconds == BAD { BAD } else { seconds * 1000 };
     }
     if len == 25 {
         let sign = *at.add(19);
@@ -325,12 +201,26 @@ unsafe fn timestamp(at: *const u8, len: usize, calendar: &mut Calendar) -> i64 {
             if local == BAD {
                 return BAD;
             }
-            let offset = i64::from(hours * 60 + minutes) * 60_000;
-            return if sign == b'+' { local - offset } else { local + offset };
+            let offset = i64::from(hours * 60 + minutes) * 60;
+            return (if sign == b'+' { local - offset } else { local + offset }) * 1000;
         }
     }
     if len == 0 {
         return BAD;
+    }
+    if len <= 16 {
+        // Up to 16 digits: two 8-digit halves.
+        let raw = _mm_sub_epi8(_mm_loadu_si128(at as *const __m128i), _mm_set1_epi8(b'0' as i8));
+        let digits = _mm_shuffle_epi8(raw, _mm_loadu_si128(RIGHT_ALIGN[len].as_ptr() as *const __m128i));
+        if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(digits, _mm_set1_epi8(9)), _mm_set1_epi8(9))) != 0xFFFF {
+            return BAD;
+        }
+        let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010A));
+        let fours = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0064));
+        let packed = _mm_packus_epi32(fours, fours);
+        let eights = _mm_madd_epi16(packed, _mm_set1_epi32(0x0001_2710));
+        let both = _mm_cvtsi128_si64(eights) as u64;
+        return ((both & 0xFFFF_FFFF) * 100_000_000 + (both >> 32)) as i64;
     }
     let mut value = 0u64;
     for index in 0..len {
@@ -343,195 +233,431 @@ unsafe fn timestamp(at: *const u8, len: usize, calendar: &mut Calendar) -> i64 {
     value as i64
 }
 
+/// A decimal number of ASCII digits, capped; `None` unless digits only.
+#[inline(always)]
+unsafe fn number(at: *const u8, len: usize) -> Option<u64> {
+    if len == 0 {
+        return None;
+    }
+    let mut value = 0u64;
+    for index in 0..len {
+        let digit = u64::from((*at.add(index)).wrapping_sub(b'0'));
+        if digit > 9 {
+            return None;
+        }
+        value = (value * 10 + digit).min(1 << 40);
+    }
+    Some(value)
+}
+
 // ---------------------------------------------------------------- context
 
 struct Context {
+    threads: usize,
     window_start: i64,
     window_end: i64,
     /// `window_start - 7 days`.
     click_start: i64,
+    /// The second that ingest times are counted from.
+    ingest_start: i64,
     /// `window_start` minus the midnight before it.
     day_offset: u64,
     first_day: i32,
     days: usize,
-    /// Product to category index, for purchases.
-    products: HashMap<Vec<u8>, u32>,
     /// Categories in byte order, `unknown` among them.
     categories: Vec<Vec<u8>>,
-    unknown: u32,
+    unknown: u8,
+    /// `pN` to category, for canonical `N` below the table's length.
+    category_by_number: Vec<u8>,
+    category_by_name: HashMap<Vec<u8>, u8>,
     campaign_ids: Vec<Vec<u8>>,
     channels: Vec<Vec<u8>>,
-    /// `c_N` to campaign index, for canonical `N` below the table's length.
+    /// `c_N` to campaign index, likewise.
     campaign_by_number: Vec<u32>,
     campaign_by_name: HashMap<Vec<u8>, u32>,
     event_bits: u32,
     person_bits: u32,
 }
 
+/// The number after `prefix`, if `id` is `prefix` and a number without leading zeros.
+fn canonical(id: &[u8], prefix: &[u8]) -> Option<usize> {
+    let digits = id.strip_prefix(prefix)?;
+    if digits.is_empty() || digits.len() > 6 || digits[0] == b'0' || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits).unwrap().parse().ok()
+}
+
+#[inline(always)]
+unsafe fn canonical_at(at: *const u8, len: usize, prefix: usize) -> usize {
+    if len <= prefix || len > prefix + 6 || *at.add(prefix) == b'0' {
+        return usize::MAX;
+    }
+    let mut value = 0usize;
+    let mut ok = true;
+    for index in prefix..len {
+        let digit = (*at.add(index)).wrapping_sub(b'0');
+        ok &= digit <= 9;
+        value = value * 10 + usize::from(digit);
+    }
+    if ok {
+        value
+    } else {
+        usize::MAX
+    }
+}
+
 impl Context {
     #[inline(always)]
     unsafe fn campaign(&self, at: *const u8, len: usize) -> u32 {
-        if (3..=8).contains(&len) && *at == b'c' && *at.add(1) == b'_' && *at.add(2) != b'0' {
-            let mut number = 0usize;
-            let mut ok = true;
-            for index in 2..len {
-                let digit = (*at.add(index)).wrapping_sub(b'0');
-                ok &= digit <= 9;
-                number = number * 10 + usize::from(digit);
-            }
-            if ok && number < self.campaign_by_number.len() {
-                return self.campaign_by_number[number];
+        if len >= 3 && (at as *const u16).read_unaligned() == u16::from_le_bytes(*b"c_") {
+            let value = canonical_at(at, len, 2);
+            if value < self.campaign_by_number.len() {
+                return *self.campaign_by_number.get_unchecked(value);
             }
         }
         self.campaign_by_name.get(std::slice::from_raw_parts(at, len)).copied().unwrap_or(NO_CAMPAIGN)
     }
+
+    #[inline(always)]
+    unsafe fn category(&self, at: *const u8, len: usize) -> u8 {
+        if *at == b'p' {
+            let value = canonical_at(at, len, 1);
+            if value < self.category_by_number.len() {
+                let category = *self.category_by_number.get_unchecked(value);
+                return if category == NO_CATEGORY { self.unknown } else { category };
+            }
+        }
+        self.category_by_name.get(std::slice::from_raw_parts(at, len)).copied().unwrap_or(self.unknown)
+    }
 }
 
-fn canonical_campaign(id: &[u8]) -> Option<usize> {
-    if (3..=8).contains(&id.len()) && id.starts_with(b"c_") && id[2] != b'0' && id[2..].iter().all(u8::is_ascii_digit) {
-        return std::str::from_utf8(&id[2..]).unwrap().parse().ok();
+fn load_context(data: &Path, event_bytes: u64, threads: usize) -> Option<Context> {
+    let (window_start, window_end) = slow::manifest(&data.join("manifest.json"));
+    if window_end <= window_start || window_end - window_start + WEEK >= 1 << 31 {
+        return None;
     }
-    None
+    let rows = |name: &str| -> Vec<(Vec<u8>, Vec<u8>)> {
+        let bytes = fs::read(data.join(name)).unwrap();
+        let mut lines: Vec<&[u8]> = bytes.split(|&byte| byte == b'\n').collect();
+        if lines.last().is_some_and(|last| last.is_empty()) {
+            lines.pop();
+        }
+        lines
+            .into_iter()
+            .skip(1)
+            .filter_map(|line| slow::fields(line, 2).map(|row| (row[0].to_vec(), row[1].to_vec())))
+            .collect()
+    };
+
+    let products = rows("products.csv");
+    let mut categories: Vec<Vec<u8>> = products.iter().map(|(_, name)| name.clone()).collect();
+    categories.push(b"unknown".to_vec());
+    categories.sort();
+    categories.dedup();
+    if categories.len() > 127 {
+        return None;
+    }
+    let category = |name: &[u8]| categories.binary_search_by(|probe| probe.as_slice().cmp(name)).unwrap() as u8;
+    let numbers: Vec<Option<usize>> = products.iter().map(|(id, _)| canonical(id, b"p")).collect();
+    let size = numbers.iter().flatten().max().map_or(0, |&most| most + 1);
+    let mut category_by_number = vec![NO_CATEGORY; size];
+    let mut category_by_name = HashMap::new();
+    for ((id, name), number) in products.iter().zip(&numbers) {
+        match number {
+            Some(number) => category_by_number[*number] = category(name),
+            None => {
+                category_by_name.insert(id.clone(), category(name));
+            }
+        }
+    }
+    let unknown = category(b"unknown");
+
+    let mut campaign_ids = Vec::new();
+    let mut channels = Vec::new();
+    let mut seen = HashMap::new();
+    for (id, channel) in rows("campaigns.csv") {
+        if !seen.contains_key(&id) {
+            seen.insert(id.clone(), campaign_ids.len() as u32);
+            campaign_ids.push(id);
+            channels.push(channel);
+        }
+    }
+    let numbers: Vec<Option<usize>> = campaign_ids.iter().map(|id| canonical(id, b"c_")).collect();
+    let size = numbers.iter().flatten().max().map_or(0, |&most| most + 1);
+    let mut campaign_by_number = vec![NO_CAMPAIGN; size];
+    let mut campaign_by_name = HashMap::new();
+    for (index, (id, number)) in campaign_ids.iter().zip(&numbers).enumerate() {
+        match number {
+            Some(number) => campaign_by_number[*number] = index as u32,
+            None => {
+                campaign_by_name.insert(id.clone(), index as u32);
+            }
+        }
+    }
+
+    let first_day = window_start.div_euclid(DAY);
+    let estimate = event_bytes / 80;
+    let bits = |per: u64, most: u32| (estimate / per).max(1).next_power_of_two().trailing_zeros().clamp(4, most);
+    Some(Context {
+        threads,
+        window_start,
+        window_end,
+        click_start: window_start - WEEK,
+        ingest_start: (window_start - INGEST_LEAD).div_euclid(1000),
+        day_offset: (window_start - first_day * DAY) as u64,
+        first_day: first_day as i32,
+        days: ((window_end - 1).div_euclid(DAY) - first_day + 1) as usize,
+        categories,
+        unknown,
+        category_by_number,
+        category_by_name,
+        campaign_ids,
+        channels,
+        campaign_by_number,
+        campaign_by_name,
+        event_bits: bits(20_000, 11),
+        person_bits: bits(40_000, 11),
+    })
+}
+
+// ---------------------------------------------------------------- links
+
+/// User ID to person, as an open-addressing table of `[user, value]`.
+///
+/// While the links are joined a value is 0 for the root of a union-find
+/// tree, or `(parent slot + 1) << 4 | 1`: no ID key ends in the nibble 1.
+/// Afterwards every value is the person's name.
+struct Links {
+    slots: *const [AtomicU64; 2],
+    mask: usize,
+}
+
+unsafe impl Sync for Links {}
+
+#[inline(always)]
+fn is_pointer(value: u64) -> bool {
+    value & 15 == 1
+}
+
+impl Links {
+    fn new(pairs: usize) -> Links {
+        let capacity = (pairs * 3).max(64).next_power_of_two();
+        Links { slots: mem::zeroed(capacity * 16) as *const [AtomicU64; 2], mask: capacity - 1 }
+    }
+
+    #[inline(always)]
+    fn home(&self, user: u64) -> usize {
+        (keys::hash(user) >> 16) as usize & self.mask
+    }
+
+    #[inline(always)]
+    fn key(&self, at: usize) -> &AtomicU64 {
+        unsafe { &(*self.slots.add(at))[0] }
+    }
+
+    #[inline(always)]
+    fn value(&self, at: usize) -> &AtomicU64 {
+        unsafe { &(*self.slots.add(at))[1] }
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, user: u64) {
+        unsafe { _mm_prefetch(self.slots.add(self.home(user)) as *const i8, _MM_HINT_T0) };
+    }
+
+    #[inline(always)]
+    fn person(&self, user: u64) -> u64 {
+        let mut at = self.home(user);
+        loop {
+            let key = self.key(at).load(Relaxed);
+            if key == user {
+                return self.value(at).load(Relaxed);
+            }
+            if key == 0 {
+                return user;
+            }
+            at = (at + 1) & self.mask;
+        }
+    }
+
+    /// Fetches the slot above `at`, if it has one.
+    #[inline(always)]
+    fn prefetch_parent(&self, at: usize) {
+        let value = self.value(at).load(Relaxed);
+        if is_pointer(value) {
+            unsafe { _mm_prefetch(self.slots.add((value >> 4) as usize - 1) as *const i8, _MM_HINT_T0) };
+        }
+    }
+
+    /// The slot of `user`, claiming one if it has none.
+    #[inline(always)]
+    fn insert(&self, user: u64) -> usize {
+        let mut at = self.home(user);
+        loop {
+            let key = self.key(at).load(Relaxed);
+            if key == user {
+                return at;
+            }
+            if key == 0 {
+                match self.key(at).compare_exchange(0, user, Relaxed, Relaxed) {
+                    Ok(_) => return at,
+                    Err(actual) if actual == user => return at,
+                    Err(_) => {}
+                }
+            }
+            at = (at + 1) & self.mask;
+        }
+    }
+
+    /// The root above a slot, halving the path to it.
+    #[inline(always)]
+    fn root(&self, mut at: usize) -> usize {
+        loop {
+            let up = self.value(at).load(Relaxed);
+            if !is_pointer(up) {
+                return at;
+            }
+            let up_at = (up >> 4) as usize - 1;
+            let above = self.value(up_at).load(Relaxed);
+            if is_pointer(above) {
+                self.value(at).store(above, Relaxed);
+            }
+            at = up_at;
+        }
+    }
+
+    fn join(&self, a: usize, b: usize) {
+        loop {
+            let (a, b) = (self.root(a), self.root(b));
+            if a == b {
+                return;
+            }
+            // The higher slot goes under the lower, so no cycle can form.
+            let (high, low) = if a > b { (a, b) } else { (b, a) };
+            let pointer = ((low as u64 + 1) << 4) | 1;
+            if self.value(high).compare_exchange(0, pointer, Relaxed, Relaxed).is_ok() {
+                return;
+            }
+        }
+    }
+}
+
+fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>]) -> Links {
+    let total: usize = pairs.iter().map(Vec::len).sum();
+    let links = Links::new(total);
+    if total == 0 {
+        return links;
+    }
+    let capacity = links.mask + 1;
+    const BATCH: usize = 1 << 12;
+    let jobs: Vec<(usize, usize)> = pairs
+        .iter()
+        .enumerate()
+        .flat_map(|(list, pairs)| (0..pairs.len().div_ceil(BATCH)).map(move |batch| (list, batch * BATCH)))
+        .collect();
+    const RANGES: usize = 256;
+    let range = capacity.div_ceil(RANGES);
+    let (next_job, next_name, next_fill) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let barrier = Barrier::new(threads);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                // Join every pair.
+                while let Some(&(list, from)) = jobs.get(next_job.fetch_add(1, Relaxed)) {
+                    let list = &pairs[list];
+                    let batch = &list[from..(from + BATCH).min(list.len())];
+                    for group in batch.chunks(16) {
+                        for &(a, b) in group {
+                            links.prefetch(a);
+                            links.prefetch(b);
+                        }
+                        let mut slots = [(0usize, 0usize); 16];
+                        for (slot, &(a, b)) in slots.iter_mut().zip(group) {
+                            *slot = (links.insert(a), links.insert(b));
+                            links.prefetch_parent(slot.0);
+                            links.prefetch_parent(slot.1);
+                        }
+                        for &(a, b) in &slots[..group.len()] {
+                            links.join(a, b);
+                        }
+                    }
+                }
+                barrier.wait();
+                // Give each root the smallest ID under it.
+                loop {
+                    let from = next_name.fetch_add(1, Relaxed) * range;
+                    if from >= capacity {
+                        break;
+                    }
+                    let to = (from + range).min(capacity);
+                    for at in from..to {
+                        if at % 16 == 0 {
+                            for ahead in at + 16..(at + 32).min(to) {
+                                links.prefetch_parent(ahead);
+                            }
+                        }
+                        let user = links.key(at).load(Relaxed);
+                        if user == 0 {
+                            continue;
+                        }
+                        let name = links.value(links.root(at));
+                        let mut current = name.load(Relaxed);
+                        while current == 0 || keys::compare(user, current).is_lt() {
+                            match name.compare_exchange(current, user, Relaxed, Relaxed) {
+                                Ok(_) => break,
+                                Err(actual) => current = actual,
+                            }
+                        }
+                    }
+                }
+                barrier.wait();
+                // And every other ID its root's name. A slot already given
+                // its name ends the walk like a root: it is the same name.
+                loop {
+                    let from = next_fill.fetch_add(1, Relaxed) * range;
+                    if from >= capacity {
+                        break;
+                    }
+                    let to = (from + range).min(capacity);
+                    for at in from..to {
+                        if at % 16 == 0 {
+                            for ahead in at + 16..(at + 32).min(to) {
+                                links.prefetch_parent(ahead);
+                            }
+                        }
+                        let mut value = links.value(at).load(Relaxed);
+                        if links.key(at).load(Relaxed) == 0 || !is_pointer(value) {
+                            continue;
+                        }
+                        while is_pointer(value) {
+                            value = links.value((value >> 4) as usize - 1).load(Relaxed);
+                        }
+                        links.value(at).store(value, Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    links
 }
 
 // ---------------------------------------------------------------- stage 1
 
-struct Parsed {
-    events: Vec<Vec<Rec>>,
-    clicks: Vec<Ck>,
+/// Field `index` of a line without its wrapping quotes.
+#[inline(always)]
+unsafe fn field(base: *const u8, ends: *const u32, quoted: u64, index: usize) -> (*const u8, usize) {
+    let strip = (quoted >> index) as usize & 1;
+    let from = *ends.add(index) as usize;
+    let to = *ends.add(index + 1) as usize - 1;
+    (base.add(from + strip), to - from - 2 * strip)
 }
 
 #[inline(always)]
-unsafe fn event_line(
-    context: &Context,
-    calendar: &mut Calendar,
-    out: &mut [Vec<Rec>],
-    base: *const u8,
-    line_start: usize,
-    ends: &[usize; 8],
-    fields: usize,
-    quotes: u32,
-) {
-    if fields != 7 {
-        return;
-    }
-    let mut stripped = 0;
-    let (id, id_len) = field(base, line_start, ends, 0, &mut stripped);
-    let (user, user_len) = field(base, line_start, ends, 1, &mut stripped);
-    let (ts, ts_len) = field(base, line_start, ends, 2, &mut stripped);
-    let (ingest, ingest_len) = field(base, line_start, ends, 3, &mut stripped);
-    let (kind, kind_len) = field(base, line_start, ends, 4, &mut stripped);
-    let (product, product_len) = field(base, line_start, ends, 5, &mut stripped);
-    let (price, price_len) = field(base, line_start, ends, 6, &mut stripped);
-    if stripped != quotes || id_len == 0 {
-        return;
-    }
-    let ingest = timestamp(ingest, ingest_len, calendar);
-    let ingest_seconds = (ingest - context.window_start) / 1000;
-    if ingest == BAD || ingest % 1000 != 0 || ingest_seconds != i64::from(ingest_seconds as i32) {
-        return bail();
-    }
-    let mut record = Rec { eid: keys::pack(id, id_len), user: 0, ts: 0, ingest: ingest_seconds as i32, payload: 0, _pad: 0 };
-    'valid: {
-        if user_len == 0 || product_len == 0 {
-            break 'valid;
-        }
-        let ts = timestamp(ts, ts_len, calendar);
-        if ts < context.window_start || ts >= context.window_end || ingest - ts > DAY {
-            break 'valid;
-        }
-        let mut payload = VALID;
-        if kind_len == 4 {
-            let word = (kind as *const u32).read_unaligned();
-            if word != u32::from_le_bytes(*b"view") && word != u32::from_le_bytes(*b"cart") {
-                break 'valid;
-            }
-        } else if kind_len == 8 && (kind as *const u64).read_unaligned() == u64::from_le_bytes(*b"purchase") {
-            if price_len == 0 {
-                break 'valid;
-            }
-            let mut value = 0u64;
-            for index in 0..price_len {
-                let digit = u64::from((*price.add(index)).wrapping_sub(b'0'));
-                if digit > 9 {
-                    break 'valid;
-                }
-                value = (value * 10 + digit).min(1 << 40);
-            }
-            if !(1..=10_000_000).contains(&value) {
-                break 'valid;
-            }
-            let category = context
-                .products
-                .get(std::slice::from_raw_parts(product, product_len))
-                .copied()
-                .unwrap_or(context.unknown);
-            payload |= category << 24 | value as u32;
-        } else {
-            break 'valid;
-        }
-        record.user = keys::pack(user, user_len);
-        record.ts = (ts - context.window_start) as u32;
-        record.payload = payload;
-    }
-    let part = (keys::hash(record.eid) >> (64 - context.event_bits)) as usize;
-    out.get_unchecked_mut(part).push(record);
-}
-
-#[inline(always)]
-unsafe fn click_line(
-    context: &Context,
-    calendar: &mut Calendar,
-    out: &mut Vec<Ck>,
-    base: *const u8,
-    line_start: usize,
-    ends: &[usize; 8],
-    fields: usize,
-    quotes: u32,
-) {
-    if fields != 4 {
-        return;
-    }
-    let mut stripped = 0;
-    let (id, id_len) = field(base, line_start, ends, 0, &mut stripped);
-    let (user, user_len) = field(base, line_start, ends, 1, &mut stripped);
-    let (campaign, campaign_len) = field(base, line_start, ends, 2, &mut stripped);
-    let (ts, ts_len) = field(base, line_start, ends, 3, &mut stripped);
-    if stripped != quotes || id_len == 0 || user_len == 0 {
-        return;
-    }
-    let campaign = context.campaign(campaign, campaign_len);
-    if campaign == NO_CAMPAIGN {
-        return;
-    }
-    let ts = timestamp(ts, ts_len, calendar);
-    if ts < context.click_start || ts >= context.window_end {
-        return;
-    }
-    out.push(Ck {
-        person: keys::pack(user, user_len),
-        id: keys::pack(id, id_len),
-        ts: (ts - context.click_start) as u32,
-        campaign,
-    });
-}
-
-#[inline(always)]
-unsafe fn link_line(
-    out: &mut Vec<(u64, u64)>,
-    base: *const u8,
-    line_start: usize,
-    ends: &[usize; 8],
-    fields: usize,
-    quotes: u32,
-) {
-    if fields != 2 {
-        return;
-    }
-    let mut stripped = 0;
-    let (a, a_len) = field(base, line_start, ends, 0, &mut stripped);
-    let (b, b_len) = field(base, line_start, ends, 1, &mut stripped);
-    if stripped != quotes || a_len == 0 || b_len == 0 {
+unsafe fn link_line(out: &mut Vec<(u64, u64)>, base: *const u8, ends: *const u32, quoted: u64) {
+    let (a, a_len) = field(base, ends, quoted, 0);
+    let (b, b_len) = field(base, ends, quoted, 1);
+    if a_len == 0 || b_len == 0 {
         return;
     }
     let (a, b) = (keys::pack(a, a_len), keys::pack(b, b_len));
@@ -540,172 +666,211 @@ unsafe fn link_line(
     }
 }
 
-// ---------------------------------------------------------------- links
-
-struct Links {
-    /// `[user, person]` slots, open addressing; a user of 0 is an empty slot.
-    slots: Vec<[u64; 2]>,
-    mask: usize,
+#[derive(Clone, Copy)]
+struct Pending {
+    eid: u64,
+    user: u64,
+    ingest: u64,
+    ts: u32,
+    payload: u32,
 }
 
-impl Links {
-    #[inline(always)]
-    fn slot(&self, user: u64) -> usize {
-        (keys::hash(user) >> 20) as usize & self.mask
-    }
+const RING: usize = 16;
 
+struct Parser<'a> {
+    context: &'a Context,
+    links: &'a Links,
+    thread: u64,
+    calendar: Calendar,
+    dedups: Dedups,
+    events: Events,
+    clicks: Clicks,
+    pending: [Pending; RING],
+    pending_count: usize,
+    pending_clicks: [Ck; RING],
+    pending_click_count: usize,
+}
+
+impl<'a> Parser<'a> {
     #[inline(always)]
-    fn person(&self, user: u64) -> u64 {
-        let mut at = self.slot(user);
-        loop {
-            let slot = unsafe { self.slots.get_unchecked(at) };
-            if slot[0] == user {
-                return slot[1];
-            }
-            if slot[0] == 0 {
-                return user;
-            }
-            at = (at + 1) & self.mask;
+    unsafe fn finish_event(&mut self, pending: Pending) {
+        let person = self.links.person(pending.user);
+        let part = (keys::hash(person) >> (64 - self.context.person_bits)) as usize;
+        let index = self.events.push(part, Ev { person, ts: pending.ts, payload: pending.payload });
+        if index >= 1 << INDEX_BITS {
+            bail();
         }
+        let place = self.thread << (INDEX_BITS + PART_BITS) | (part as u64) << INDEX_BITS | index as u64 & ((1 << INDEX_BITS) - 1);
+        let part = (keys::hash(pending.eid) >> (64 - self.context.event_bits)) as usize;
+        self.dedups.push(part, Dedup { eid: pending.eid, meta: pending.ingest << REF_BITS | place });
     }
 
     #[inline(always)]
-    fn prefetch(&self, user: u64) {
-        unsafe { _mm_prefetch(self.slots.as_ptr().add(self.slot(user)) as *const i8, _MM_HINT_T0) };
-    }
-
-    fn build(pairs: &[Vec<(u64, u64)>]) -> Links {
-        let total: usize = pairs.iter().map(Vec::len).sum();
-        let capacity = (total * 4).max(16).next_power_of_two();
-        let mut links = Links { slots: vec![[0u64; 2]; capacity], mask: capacity - 1 };
-        let mut parent: Vec<u32> = Vec::with_capacity(total * 2);
-        let mut name: Vec<u64> = Vec::with_capacity(total * 2);
-        let mut index = |links: &mut Links, parent: &mut Vec<u32>, name: &mut Vec<u64>, user: u64| -> u32 {
-            let mut at = links.slot(user);
-            loop {
-                let slot = &mut links.slots[at];
-                if slot[0] == user {
-                    return slot[1] as u32;
-                }
-                if slot[0] == 0 {
-                    let id = parent.len() as u32;
-                    *slot = [user, u64::from(id)];
-                    parent.push(id);
-                    name.push(user);
-                    return id;
-                }
-                at = (at + 1) & links.mask;
-            }
-        };
-        fn root(parent: &mut [u32], mut at: u32) -> u32 {
-            loop {
-                let up = parent[at as usize];
-                if up == at {
-                    return at;
-                }
-                let above = parent[up as usize];
-                parent[at as usize] = above;
-                at = above;
-            }
+    unsafe fn event_line(&mut self, base: *const u8, ends: *const u32, quoted: u64) {
+        let context = self.context;
+        let (id, id_len) = field(base, ends, quoted, 0);
+        let (user, user_len) = field(base, ends, quoted, 1);
+        let (ts, ts_len) = field(base, ends, quoted, 2);
+        let (ingest, ingest_len) = field(base, ends, quoted, 3);
+        let (kind, kind_len) = field(base, ends, quoted, 4);
+        let (product, product_len) = field(base, ends, quoted, 5);
+        let (price, price_len) = field(base, ends, quoted, 6);
+        if id_len == 0 {
+            return;
         }
-        for list in pairs {
-            for &(a, b) in list {
-                let a = index(&mut links, &mut parent, &mut name, a);
-                let b = index(&mut links, &mut parent, &mut name, b);
-                let (a, b) = (root(&mut parent, a), root(&mut parent, b));
-                if a != b {
-                    parent[a as usize] = b;
-                    if keys::compare(name[a as usize], name[b as usize]).is_lt() {
-                        name[b as usize] = name[a as usize];
+        // `ingest_ts` is always whole seconds in UTC; anything else goes to the slow path.
+        if ingest_len != 20 || *ingest.add(19) != b'Z' {
+            return bail();
+        }
+        let ingest = civil(ingest, &mut self.calendar);
+        let seconds = ingest.wrapping_sub(context.ingest_start) as u64;
+        if ingest == BAD || seconds >> INGEST_BITS != 0 {
+            return bail();
+        }
+        let ingest = ingest * 1000;
+        let eid = keys::pack(id, id_len);
+        'valid: {
+            if user_len == 0 || product_len == 0 {
+                break 'valid;
+            }
+            let ts = timestamp(ts, ts_len, &mut self.calendar);
+            if ts < context.window_start || ts >= context.window_end || ingest - ts > DAY {
+                break 'valid;
+            }
+            let mut payload = 0;
+            if kind_len == 4 {
+                let word = (kind as *const u32).read_unaligned();
+                if word != u32::from_le_bytes(*b"view") && word != u32::from_le_bytes(*b"cart") {
+                    break 'valid;
+                }
+            } else if kind_len == 8 && (kind as *const u64).read_unaligned() == u64::from_le_bytes(*b"purchase") {
+                match number(price, price_len) {
+                    Some(value) if (1..=10_000_000).contains(&value) => {
+                        payload = u32::from(context.category(product, product_len)) << 24 | value as u32;
                     }
+                    _ => break 'valid,
                 }
+            } else {
+                break 'valid;
             }
-        }
-        for slot in &mut links.slots {
-            if slot[0] != 0 {
-                slot[1] = name[root(&mut parent, slot[1] as u32) as usize];
+            let user = keys::pack(user, user_len);
+            self.links.prefetch(user);
+            let slot = self.pending_count % RING;
+            if self.pending_count >= RING {
+                self.finish_event(self.pending[slot]);
             }
+            self.pending[slot] = Pending { eid, user, ingest: seconds, ts: (ts - context.window_start) as u32, payload };
+            self.pending_count += 1;
+            return;
         }
-        links
+        let part = (keys::hash(eid) >> (64 - context.event_bits)) as usize;
+        self.dedups.push(part, Dedup { eid, meta: seconds << REF_BITS | NO_REF });
+    }
+
+    #[inline(always)]
+    unsafe fn finish_click(&mut self, click: Ck) {
+        let person = self.links.person(click.person);
+        let part = (keys::hash(person) >> (64 - self.context.person_bits)) as usize;
+        self.clicks.push(part, Ck { person, ..click });
+    }
+
+    #[inline(always)]
+    unsafe fn click_line(&mut self, base: *const u8, ends: *const u32, quoted: u64) {
+        let context = self.context;
+        let (id, id_len) = field(base, ends, quoted, 0);
+        let (user, user_len) = field(base, ends, quoted, 1);
+        let (campaign, campaign_len) = field(base, ends, quoted, 2);
+        let (ts, ts_len) = field(base, ends, quoted, 3);
+        if id_len == 0 || user_len == 0 {
+            return;
+        }
+        let campaign = context.campaign(campaign, campaign_len);
+        if campaign == NO_CAMPAIGN {
+            return;
+        }
+        let ts = timestamp(ts, ts_len, &mut self.calendar);
+        if ts < context.click_start || ts >= context.window_end {
+            return;
+        }
+        let user = keys::pack(user, user_len);
+        self.links.prefetch(user);
+        let slot = self.pending_click_count % RING;
+        if self.pending_click_count >= RING {
+            self.finish_click(self.pending_clicks[slot]);
+        }
+        self.pending_clicks[slot] =
+            Ck { person: user, id: keys::pack(id, id_len), ts: (ts - context.click_start) as u32, campaign };
+        self.pending_click_count += 1;
+    }
+
+    unsafe fn finish(&mut self) {
+        for slot in 0..self.pending_count.min(RING) {
+            self.finish_event(self.pending[slot]);
+        }
+        for slot in 0..self.pending_click_count.min(RING) {
+            self.finish_click(self.pending_clicks[slot]);
+        }
+        self.dedups.finish();
+        self.events.finish();
+        self.clicks.finish();
     }
 }
+
+struct Parsed {
+    dedups: Dedups,
+    events: Events,
+    clicks: Clicks,
+}
+
+unsafe impl Send for Parsed {}
+unsafe impl Sync for Parsed {}
 
 // ---------------------------------------------------------------- stage 2
 
-struct Shuffled {
-    events: Vec<Vec<Ev>>,
-    clicks: Vec<Vec<Ck>>,
-}
-
-/// Dedups one event partition and sends the surviving events to their person's partition.
-fn dedup(context: &Context, links: &Links, parts: &[&[Rec]], table: &mut Vec<*const Rec>, out: &mut [Vec<Ev>]) {
-    let total: usize = parts.iter().map(|part| part.len()).sum();
+/// Dedups one event-ID partition: every copy but the earliest ingested is tombstoned.
+unsafe fn dedup(context: &Context, parsed: &[Parsed], part: usize, records: &mut Vec<Dedup>, table: &mut Vec<u32>) {
+    records.clear();
+    for thread in parsed {
+        thread.dedups.for_each_chunk(part, |chunk| records.extend_from_slice(chunk));
+    }
+    let total = records.len();
     if total == 0 {
         return;
     }
     let capacity = (total * 2).next_power_of_two();
     table.clear();
-    table.resize(capacity, std::ptr::null());
+    table.resize(capacity, 0);
     let mask = capacity - 1;
     let shift = 64 - context.event_bits - capacity.trailing_zeros();
-    for part in parts {
-        for record in *part {
-            let mut at = (keys::hash(record.eid) >> shift) as usize & mask;
-            loop {
-                let slot = unsafe { table.get_unchecked_mut(at) };
-                if slot.is_null() {
-                    *slot = record;
-                    break;
-                }
-                let kept = unsafe { &**slot };
-                if kept.eid == record.eid {
-                    if record.ingest < kept.ingest {
-                        *slot = record;
-                    }
-                    break;
-                }
-                at = (at + 1) & mask;
-            }
-        }
-    }
-    let shift = 64 - context.person_bits;
-    let mut batch = [(0u64, 0u32, 0u32); 32];
-    let mut filled = 0;
-    let mut flush = |batch: &[(u64, u32, u32)]| {
-        for &(user, ts, payload) in batch {
-            let person = links.person(user);
-            let part = (keys::hash(person) >> shift) as usize;
-            unsafe { out.get_unchecked_mut(part) }.push(Ev { person, ts, payload });
+    let kill = |meta: u64| {
+        let place = meta & NO_REF;
+        if place != NO_REF {
+            let thread = (place >> (INDEX_BITS + PART_BITS)) as usize;
+            let part = (place >> INDEX_BITS) as usize & ((1 << PART_BITS) - 1);
+            let index = place as usize & ((1 << INDEX_BITS) - 1);
+            (*parsed[thread].events.at(part, index)).payload = TOMBSTONE;
         }
     };
-    for &slot in table.iter() {
-        if slot.is_null() {
-            continue;
-        }
-        let record = unsafe { &*slot };
-        if record.payload & VALID != 0 {
-            links.prefetch(record.user);
-            batch[filled] = (record.user, record.ts, record.payload);
-            filled += 1;
-            if filled == batch.len() {
-                flush(&batch);
-                filled = 0;
+    for index in 0..total {
+        let record = *records.get_unchecked(index);
+        let mut at = (keys::hash(record.eid) >> shift) as usize & mask;
+        loop {
+            let slot = table.get_unchecked_mut(at);
+            if *slot == 0 {
+                *slot = index as u32 + 1;
+                break;
             }
-        }
-    }
-    flush(&batch[..filled]);
-}
-
-fn shuffle_clicks(context: &Context, links: &Links, clicks: &[Ck], out: &mut [Vec<Ck>]) {
-    let shift = 64 - context.person_bits;
-    for chunk in clicks.chunks(32) {
-        for click in chunk {
-            links.prefetch(click.person);
-        }
-        for click in chunk {
-            let person = links.person(click.person);
-            let part = (keys::hash(person) >> shift) as usize;
-            unsafe { out.get_unchecked_mut(part) }.push(Ck { person, ..*click });
+            let kept = *records.get_unchecked(*slot as usize - 1);
+            if kept.eid == record.eid {
+                if record.meta >> REF_BITS < kept.meta >> REF_BITS {
+                    kill(kept.meta);
+                    *slot = index as u32 + 1;
+                } else {
+                    kill(record.meta);
+                }
+                break;
+            }
+            at = (at + 1) & mask;
         }
     }
 }
@@ -831,9 +996,9 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// One person partition: `events` and `clicks` are the partition's slices from every thread.
-    fn partition(&mut self, events: &[&[Ev]], clicks: &[&[Ck]]) {
-        let total: usize = events.iter().map(|part| part.len()).sum();
+    /// One person partition, from every thread's streams.
+    unsafe fn partition(&mut self, parsed: &[Parsed], part: usize) {
+        let total: usize = parsed.iter().map(|thread| thread.events.len(part)).sum();
         if total == 0 {
             return;
         }
@@ -847,27 +1012,32 @@ impl<'a> Worker<'a> {
         self.people.clear();
         self.counts.clear();
         self.owner.clear();
-        for part in events {
-            for event in *part {
-                let mut at = (keys::hash(event.person) >> shift) as usize & mask;
-                let id = loop {
-                    let key = unsafe { self.keys.get_unchecked_mut(at) };
-                    if *key == event.person {
-                        break self.ids[at];
+        for thread in parsed {
+            thread.events.for_each_chunk(part, |chunk| {
+                for event in chunk {
+                    if event.payload == TOMBSTONE {
+                        continue;
                     }
-                    if *key == 0 {
-                        *key = event.person;
-                        let id = self.people.len() as u32;
-                        self.ids[at] = id;
-                        self.people.push(event.person);
-                        self.counts.push(0);
-                        break id;
-                    }
-                    at = (at + 1) & mask;
-                };
-                self.counts[id as usize] += 1;
-                self.owner.push(id);
-            }
+                    let mut at = (keys::hash(event.person) >> shift) as usize & mask;
+                    let id = loop {
+                        let key = self.keys.get_unchecked_mut(at);
+                        if *key == event.person {
+                            break *self.ids.get_unchecked(at);
+                        }
+                        if *key == 0 {
+                            *key = event.person;
+                            let id = self.people.len() as u32;
+                            *self.ids.get_unchecked_mut(at) = id;
+                            self.people.push(event.person);
+                            self.counts.push(0);
+                            break id;
+                        }
+                        at = (at + 1) & mask;
+                    };
+                    *self.counts.get_unchecked_mut(id as usize) += 1;
+                    self.owner.push(id);
+                }
+            });
         }
         let people = self.people.len();
         // counts[p] becomes where person p's events end, then where they start.
@@ -876,15 +1046,23 @@ impl<'a> Worker<'a> {
             sum += *count;
             *count = sum;
         }
+        let total = sum as usize;
+        self.events.clear();
         self.events.resize(total, 0);
         let mut next = 0;
-        for part in events {
-            for event in *part {
-                let id = self.owner[next] as usize;
-                next += 1;
-                self.counts[id] -= 1;
-                self.events[self.counts[id] as usize] = u64::from(event.ts) << 32 | u64::from(event.payload);
-            }
+        for thread in parsed {
+            thread.events.for_each_chunk(part, |chunk| {
+                for event in chunk {
+                    if event.payload == TOMBSTONE {
+                        continue;
+                    }
+                    let id = *self.owner.get_unchecked(next) as usize;
+                    next += 1;
+                    let at = self.counts.get_unchecked_mut(id);
+                    *at -= 1;
+                    *self.events.get_unchecked_mut(*at as usize) = u64::from(event.ts) << 32 | u64::from(event.payload);
+                }
+            });
         }
         self.counts.push(total as u32);
 
@@ -892,24 +1070,26 @@ impl<'a> Worker<'a> {
         self.click_counts.clear();
         self.click_counts.resize(people, 0);
         self.owner.clear();
-        for part in clicks {
-            for click in *part {
-                let mut at = (keys::hash(click.person) >> shift) as usize & mask;
-                let id = loop {
-                    let key = self.keys[at];
-                    if key == click.person {
-                        break self.ids[at];
+        for thread in parsed {
+            thread.clicks.for_each_chunk(part, |chunk| {
+                for click in chunk {
+                    let mut at = (keys::hash(click.person) >> shift) as usize & mask;
+                    let id = loop {
+                        let key = *self.keys.get_unchecked(at);
+                        if key == click.person {
+                            break *self.ids.get_unchecked(at);
+                        }
+                        if key == 0 {
+                            break u32::MAX;
+                        }
+                        at = (at + 1) & mask;
+                    };
+                    if id != u32::MAX {
+                        self.click_counts[id as usize] += 1;
                     }
-                    if key == 0 {
-                        break u32::MAX;
-                    }
-                    at = (at + 1) & mask;
-                };
-                if id != u32::MAX {
-                    self.click_counts[id as usize] += 1;
+                    self.owner.push(id);
                 }
-                self.owner.push(id);
-            }
+            });
         }
         let mut sum = 0;
         for count in &mut self.click_counts {
@@ -920,15 +1100,17 @@ impl<'a> Worker<'a> {
         self.clicks.clear();
         self.clicks.resize(click_total, Ck { person: 0, id: 0, ts: 0, campaign: 0 });
         let mut next = 0;
-        for part in clicks {
-            for click in *part {
-                let id = self.owner[next];
-                next += 1;
-                if id != u32::MAX {
-                    self.click_counts[id as usize] -= 1;
-                    self.clicks[self.click_counts[id as usize] as usize] = *click;
+        for thread in parsed {
+            thread.clicks.for_each_chunk(part, |chunk| {
+                for click in chunk {
+                    let id = self.owner[next];
+                    next += 1;
+                    if id != u32::MAX {
+                        self.click_counts[id as usize] -= 1;
+                        self.clicks[self.click_counts[id as usize] as usize] = *click;
+                    }
                 }
-            }
+            });
         }
         self.click_counts.push(click_total as u32);
 
@@ -975,7 +1157,7 @@ impl<'a> Worker<'a> {
                 last = ts;
                 let price = events[at] as u32 & 0x00FF_FFFF;
                 if price != 0 {
-                    let category = (events[at] as u32 >> 24 & 0x7F) as usize;
+                    let category = (events[at] as u32 >> 24) as usize;
                     revenue += i64::from(price);
                     if self.category_sum[category] == 0 {
                         self.category_used.push(category as u32);
@@ -1044,74 +1226,12 @@ impl<'a> Worker<'a> {
 
 // ---------------------------------------------------------------- main
 
-fn load_context(data: &Path, event_bytes: u64) -> Option<Context> {
-    let (window_start, window_end) = slow::manifest(&data.join("manifest.json"));
-    if window_end <= window_start || window_end - window_start + WEEK >= 1 << 31 {
-        return None;
-    }
-    let mut categories: Vec<Vec<u8>> = vec![b"unknown".to_vec()];
-    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for line in slow::file_lines(&data.join("products.csv")) {
-        if let Some(row) = slow::fields(&line, 2) {
-            rows.push((row[0].to_vec(), row[1].to_vec()));
-            categories.push(row[1].to_vec());
-        }
-    }
-    categories.sort();
-    categories.dedup();
-    if categories.len() > 127 {
-        return None;
-    }
-    let category = |name: &[u8]| categories.binary_search_by(|probe| probe.as_slice().cmp(name)).unwrap() as u32;
-    let products: HashMap<Vec<u8>, u32> = rows.iter().map(|(id, name)| (id.clone(), category(name))).collect();
-    let unknown = category(b"unknown");
-
-    let mut campaign_ids = Vec::new();
-    let mut channels = Vec::new();
-    let mut campaign_by_name = HashMap::new();
-    for line in slow::file_lines(&data.join("campaigns.csv")) {
-        if let Some(row) = slow::fields(&line, 2) {
-            if !campaign_by_name.contains_key(row[0]) {
-                campaign_by_name.insert(row[0].to_vec(), campaign_ids.len() as u32);
-                campaign_ids.push(row[0].to_vec());
-                channels.push(row[1].to_vec());
-            }
-        }
-    }
-    if campaign_ids.len() > 1 << 20 {
-        return None;
-    }
-    let numbers: Vec<Option<usize>> = campaign_ids.iter().map(|id| canonical_campaign(id)).collect();
-    let size = numbers.iter().flatten().max().map_or(0, |&most| most + 1).min(1 << 20);
-    let mut campaign_by_number = vec![NO_CAMPAIGN; size];
-    for (index, number) in numbers.iter().enumerate() {
-        if let Some(number) = number {
-            if *number < size {
-                campaign_by_number[*number] = index as u32;
-            }
-        }
-    }
-
-    let first_day = window_start.div_euclid(DAY);
-    let estimate = event_bytes / 80;
-    let bits = |per: u64| (estimate / per).max(1).next_power_of_two().trailing_zeros().clamp(4, 12);
-    Some(Context {
-        window_start,
-        window_end,
-        click_start: window_start - WEEK,
-        day_offset: (window_start - first_day * DAY) as u64,
-        first_day: first_day as i32,
-        days: ((window_end - 1).div_euclid(DAY) - first_day + 1) as usize,
-        products,
-        categories,
-        unknown,
-        campaign_ids,
-        channels,
-        campaign_by_number,
-        campaign_by_name,
-        event_bits: bits(40_000),
-        person_bits: bits(40_000),
-    })
+fn csv_files(folder: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(folder)
+        .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+        .unwrap_or_default();
+    paths.retain(|path| path.extension().is_some_and(|ext| ext == "csv") && path.is_file());
+    paths
 }
 
 fn main() {
@@ -1130,40 +1250,42 @@ fn main() {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&count| count > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from));
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
+        .min(16);
     let verbose = std::env::var_os("SHOPSESS_QUIET").is_none();
     let lap = |what: &str| {
         if verbose {
-            eprintln!("{:>8.1} ms  {what}", started.elapsed().as_secs_f64() * 1e3);
+            let mut cpu = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut cpu) };
+            let cpu = cpu.tv_sec as f64 * 1e3 + cpu.tv_nsec as f64 / 1e6;
+            eprintln!("{:>8.1} ms  cpu {cpu:>8.1} ms  {what}", started.elapsed().as_secs_f64() * 1e3);
         }
     };
 
     fs::create_dir_all(output.join("user_daily")).unwrap();
     fs::create_dir_all(output.join("campaign_daily")).unwrap();
 
-    let link_inputs: Vec<Input> = csv_files(&data.join("links")).iter().map(|path| open(path)).collect();
-    let click_inputs: Vec<Input> = csv_files(&data.join("clicks")).iter().map(|path| open(path)).collect();
-    let event_inputs: Vec<Input> = csv_files(&data.join("events")).iter().map(|path| open(path)).collect();
-    let event_bytes: u64 = event_inputs.iter().map(|input| (input.cut + input.tail_end) as u64).sum();
-    let Some(context) = load_context(&data, event_bytes) else {
-        return slow::run(&data, &output);
-    };
-    let context = &context;
+    let open_all = |folder: &str| -> Vec<Input> { csv_files(&data.join(folder)).iter().map(|path| scan::open(path)).collect() };
+    let link_inputs = open_all("links");
+    let click_inputs = open_all("clicks");
+    let event_inputs = open_all("events");
+    let event_bytes: u64 = event_inputs.iter().map(Input::len).sum();
     lap("opened");
 
-    // Stage 1: links, then clicks and events while one thread joins the links.
-    const CHUNK: usize = 1 << 20;
-    let link_tasks = tasks(&link_inputs, CHUNK);
+    // Stage 0: links, while this thread reads the small files.
+    const CHUNK: usize = 1 << 19;
+    let link_tasks = scan::tasks(&link_inputs, CHUNK);
     let next = AtomicUsize::new(0);
-    let pairs: Vec<Vec<(u64, u64)>> = std::thread::scope(|scope| {
+    let (context, pairs) = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {
                     let mut out = Vec::new();
+                    let mut index = Index::new();
                     while let Some(&task) = link_tasks.get(next.fetch_add(1, Relaxed)) {
                         unsafe {
-                            run_task(&link_inputs[task.file], task, |base, start, ends, fields, quotes| {
-                                link_line(&mut out, base, start, ends, fields, quotes)
+                            scan::run::<2>(&link_inputs[task.file], task, &mut index, |base, ends, quoted| {
+                                link_line(&mut out, base, ends, quoted)
                             });
                         }
                     }
@@ -1171,108 +1293,94 @@ fn main() {
                 })
             })
             .collect();
-        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+        let context = load_context(&data, event_bytes, threads);
+        let pairs: Vec<Vec<(u64, u64)>> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        (context, pairs)
     });
+    let Some(context) = context else {
+        return slow::run(&data, &output);
+    };
+    let context = &context;
     lap("links parsed");
+    let links = build_links(threads, &pairs);
+    let links = &links;
+    lap("links joined");
 
-    let click_tasks = tasks(&click_inputs, CHUNK);
-    let event_tasks = tasks(&event_inputs, CHUNK);
+    // Stage 1: events and clicks.
+    let click_tasks = scan::tasks(&click_inputs, CHUNK);
+    let event_tasks = scan::tasks(&event_inputs, CHUNK);
     let (next_click, next_event) = (AtomicUsize::new(0), AtomicUsize::new(0));
-    let event_parts = 1usize << context.event_bits;
-    let reserve = (event_bytes / 70 / threads as u64 / event_parts as u64) as usize * 5 / 4 + 16;
-    let (links, parsed): (Links, Vec<Parsed>) = std::thread::scope(|scope| {
+    let parsed: Vec<Parsed> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
-                let pairs = &pairs;
                 let (click_tasks, event_tasks, click_inputs, event_inputs) =
                     (&click_tasks, &event_tasks, &click_inputs, &event_inputs);
                 let (next_click, next_event) = (&next_click, &next_event);
-                scope.spawn(move || {
-                    let links = (thread == 0).then(|| Links::build(pairs));
-                    let mut calendar = Calendar { year_month: 0, days: 0, days_in_month: 0 };
-                    let mut parsed = Parsed {
-                        events: (0..event_parts).map(|_| Vec::with_capacity(reserve)).collect(),
-                        clicks: Vec::new(),
+                scope.spawn(move || unsafe {
+                    let arena = Arena::leak();
+                    let empty = Pending { eid: 0, user: 0, ingest: 0, ts: 0, payload: 0 };
+                    let mut parser = Parser {
+                        context,
+                        links,
+                        thread: thread as u64,
+                        calendar: Calendar::new(),
+                        dedups: Scatter::new(arena, 1 << context.event_bits),
+                        events: Scatter::new(arena, 1 << context.person_bits),
+                        clicks: Scatter::new(arena, 1 << context.person_bits),
+                        pending: [empty; RING],
+                        pending_count: 0,
+                        pending_clicks: [Ck { person: 0, id: 0, ts: 0, campaign: 0 }; RING],
+                        pending_click_count: 0,
                     };
+                    let mut index = Index::new();
                     while let Some(&task) = event_tasks.get(next_event.fetch_add(1, Relaxed)) {
-                        unsafe {
-                            run_task(&event_inputs[task.file], task, |base, start, ends, fields, quotes| {
-                                event_line(context, &mut calendar, &mut parsed.events, base, start, ends, fields, quotes)
-                            });
-                        }
+                        scan::run::<7>(&event_inputs[task.file], task, &mut index, |base, ends, quoted| {
+                            parser.event_line(base, ends, quoted)
+                        });
                     }
                     while let Some(&task) = click_tasks.get(next_click.fetch_add(1, Relaxed)) {
-                        unsafe {
-                            run_task(&click_inputs[task.file], task, |base, start, ends, fields, quotes| {
-                                click_line(context, &mut calendar, &mut parsed.clicks, base, start, ends, fields, quotes)
-                            });
-                        }
+                        scan::run::<4>(&click_inputs[task.file], task, &mut index, |base, ends, quoted| {
+                            parser.click_line(base, ends, quoted)
+                        });
                     }
-                    (links, parsed)
+                    parser.finish();
+                    Parsed { dedups: parser.dedups, events: parser.events, clicks: parser.clicks }
                 })
             })
             .collect();
-        let mut links = None;
-        let mut all = Vec::new(); // per thread
-        for handle in handles {
-            let (built, parsed) = handle.join().unwrap();
-            links = links.or(built);
-            all.push(parsed);
-        }
-        (links.unwrap(), all)
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
     lap("parsed");
     if BAIL.load(Relaxed) {
         return slow::run(&data, &output);
     }
 
-    // Stage 2: dedup events, name people, partition by person.
-    let person_parts = 1usize << context.person_bits;
+    // Stage 2: dedup.
+    let event_parts = 1usize << context.event_bits;
     let next = AtomicUsize::new(0);
-    const CLICK_CHUNK: usize = 1 << 16;
-    let click_jobs: Vec<(usize, usize)> = parsed
-        .iter()
-        .enumerate()
-        .flat_map(|(thread, parsed)| (0..parsed.clicks.len().div_ceil(CLICK_CHUNK)).map(move |chunk| (thread, chunk)))
-        .collect();
-    let next_click = AtomicUsize::new(0);
-    let shuffled: Vec<Shuffled> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut out = Shuffled {
-                        events: (0..person_parts).map(|_| Vec::new()).collect(),
-                        clicks: (0..person_parts).map(|_| Vec::new()).collect(),
-                    };
-                    let mut table = Vec::new();
-                    loop {
-                        let part = next.fetch_add(1, Relaxed);
-                        if part >= event_parts {
-                            break;
-                        }
-                        let parts: Vec<&[Rec]> = parsed.iter().map(|parsed| parsed.events[part].as_slice()).collect();
-                        dedup(context, &links, &parts, &mut table, &mut out.events);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let (mut records, mut table) = (Vec::new(), Vec::new());
+                loop {
+                    let part = next.fetch_add(1, Relaxed);
+                    if part >= event_parts {
+                        break;
                     }
-                    while let Some(&(thread, chunk)) = click_jobs.get(next_click.fetch_add(1, Relaxed)) {
-                        let clicks = &parsed[thread].clicks;
-                        let from = chunk * CLICK_CHUNK;
-                        let to = (from + CLICK_CHUNK).min(clicks.len());
-                        shuffle_clicks(context, &links, &clicks[from..to], &mut out.clicks);
-                    }
-                    out
-                })
-            })
-            .collect();
-        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+                    unsafe { dedup(context, &parsed, part, &mut records, &mut table) };
+                }
+            });
+        }
     });
-    lap("shuffled");
+    lap("deduped");
 
     // Stage 3: sessions per person partition.
+    let person_parts = 1usize << context.person_bits;
     let next = AtomicUsize::new(0);
     let tallies: Vec<Vec<Tally>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
-                let (shuffled, next, output) = (&shuffled, &next, &output);
+                let (parsed, next, output) = (&parsed, &next, &output);
                 scope.spawn(move || {
                     let mut worker = Worker::new(context, output, thread);
                     loop {
@@ -1280,9 +1388,7 @@ fn main() {
                         if part >= person_parts {
                             break;
                         }
-                        let events: Vec<&[Ev]> = shuffled.iter().map(|shuffled| shuffled.events[part].as_slice()).collect();
-                        let clicks: Vec<&[Ck]> = shuffled.iter().map(|shuffled| shuffled.clicks[part].as_slice()).collect();
-                        worker.partition(&events, &clicks);
+                        unsafe { worker.partition(parsed, part) };
                     }
                     worker.write_file();
                     worker.tallies

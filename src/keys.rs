@@ -49,25 +49,65 @@ fn intern(bytes: &[u8]) -> u64 {
     at << 4 | 15
 }
 
+/// Masks that keep the first `len` bytes of a vector.
+static KEEP: [[u8; 16]; 11] = {
+    let mut table = [[0u8; 16]; 11];
+    let mut len = 0;
+    while len <= 10 {
+        let mut at = 0;
+        while at < len {
+            table[len][at] = 0xFF;
+            at += 1;
+        }
+        len += 1;
+    }
+    table
+};
+
 /// The key of a non-empty ID.
 ///
 /// # Safety
-/// `at..at + len` must be readable.
+/// `at..at + max(len, 16)` must be readable.
 #[inline(always)]
 pub unsafe fn pack(at: *const u8, len: usize) -> u64 {
+    use std::arch::x86_64::*;
     if len <= 10 {
-        let mut key = 0u64;
-        let mut ok = true;
-        for offset in 0..len {
-            let code = CODE[*at.add(offset) as usize];
-            ok &= code != 0;
-            key = key << 6 | u64::from(code);
-        }
-        if ok {
-            return key << (6 * (10 - len) + 4);
+        let keep = _mm_loadu_si128(KEEP.get_unchecked(len).as_ptr() as *const __m128i);
+        let bytes = _mm_and_si128(_mm_loadu_si128(at as *const __m128i), keep);
+        let between = |low: u8, high: u8| {
+            _mm_and_si128(
+                _mm_cmpgt_epi8(bytes, _mm_set1_epi8(low as i8 - 1)),
+                _mm_cmpgt_epi8(_mm_set1_epi8(high as i8 + 1), bytes),
+            )
+        };
+        let (digit, upper, lower) = (between(b'0', b'9'), between(b'A', b'Z'), between(b'a', b'z'));
+        // Each class maps to its codes by subtracting a constant.
+        let offset = _mm_or_si128(
+            _mm_or_si128(_mm_and_si128(digit, _mm_set1_epi8(0x2F)), _mm_and_si128(upper, _mm_set1_epi8(0x36))),
+            _mm_and_si128(lower, _mm_set1_epi8(0x3C)),
+        );
+        let known = _mm_or_si128(_mm_or_si128(digit, upper), lower);
+        if _mm_movemask_epi8(_mm_xor_si128(known, keep)) == 0 {
+            let codes = _mm_sub_epi8(bytes, offset);
+            let pairs = _mm_maddubs_epi16(codes, _mm_set1_epi16(0x0140));
+            let fours = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_1000));
+            let low = _mm_cvtsi128_si64(fours) as u64;
+            let high = _mm_extract_epi32(fours, 2) as u32 as u64;
+            return ((low & 0xFFFF_FFFF) << 36 | (low >> 32) << 12 | high >> 12) << 4;
         }
     }
     intern(std::slice::from_raw_parts(at, len))
+}
+
+/// `pack` for a slice, which need not have 16 readable bytes.
+pub fn pack_slice(id: &[u8]) -> u64 {
+    let mut padded = [0u8; 16];
+    if id.len() <= 10 {
+        padded[..id.len()].copy_from_slice(id);
+        unsafe { pack(padded.as_ptr(), id.len()) }
+    } else {
+        intern(id)
+    }
 }
 
 /// Appends the ID of `key` to `out`.
