@@ -3,20 +3,21 @@
 
 use std::arch::x86_64::*;
 
-/// Zeroed, page-aligned memory that is never freed.
-pub fn zeroed(bytes: usize) -> *mut u8 {
+/// Zeroed, page-aligned memory that is never freed. `populate` maps it all
+/// now, in one call, instead of a fault per page.
+pub fn zeroed(bytes: usize, populate: bool) -> *mut u8 {
     let bytes = bytes.max(4096);
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
     unsafe {
         let at = libc::mmap(
             std::ptr::null_mut(),
             bytes,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            if populate { flags | libc::MAP_POPULATE } else { flags },
             -1,
             0,
         );
         assert!(at != libc::MAP_FAILED, "mmap failed");
-        libc::madvise(at, bytes, libc::MADV_HUGEPAGE);
         at as *mut u8
     }
 }
@@ -24,13 +25,21 @@ pub fn zeroed(bytes: usize) -> *mut u8 {
 pub struct Arena {
     at: *mut u8,
     end: *mut u8,
+    regions: Vec<(*mut u8, usize)>,
 }
 
-const REGION: usize = 64 << 20;
+const REGION: usize = 8 << 20;
 
 impl Arena {
     pub fn leak() -> *mut Arena {
-        Box::leak(Box::new(Arena { at: std::ptr::null_mut(), end: std::ptr::null_mut() }))
+        Box::leak(Box::new(Arena { at: std::ptr::null_mut(), end: std::ptr::null_mut(), regions: Vec::new() }))
+    }
+
+    /// Gives the memory back. Nothing may use it afterwards.
+    pub unsafe fn release(&mut self) {
+        for &(at, size) in &self.regions {
+            libc::madvise(at as *mut libc::c_void, size, libc::MADV_DONTNEED);
+        }
     }
 
     /// `bytes` of zeroed memory aligned to 64 bytes.
@@ -39,8 +48,9 @@ impl Arena {
         let bytes = (bytes + 63) & !63;
         if (self.end as usize) - (self.at as usize) < bytes {
             let size = bytes.max(REGION);
-            self.at = zeroed(size);
+            self.at = zeroed(size, true);
             self.end = self.at.add(size);
+            self.regions.push((self.at, size));
         }
         let out = self.at;
         self.at = self.at.add(bytes);
@@ -133,6 +143,10 @@ impl<T: Copy, const K: usize> Scatter<T, K> {
             }
         }
         _mm_sfence();
+    }
+
+    pub fn arena(&self) -> *mut Arena {
+        self.arena
     }
 
     pub fn len(&self, part: usize) -> usize {

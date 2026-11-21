@@ -443,7 +443,7 @@ fn is_pointer(value: u64) -> bool {
 impl Links {
     fn new(pairs: usize) -> Links {
         let capacity = (pairs * 3).max(64).next_power_of_two();
-        Links { slots: mem::zeroed(capacity * 16) as *const [AtomicU64; 2], mask: capacity - 1 }
+        Links { slots: mem::zeroed(capacity * 16, false) as *const [AtomicU64; 2], mask: capacity - 1 }
     }
 
     #[inline(always)]
@@ -1377,10 +1377,11 @@ fn main() {
     // Stage 3: sessions per person partition.
     let person_parts = 1usize << context.person_bits;
     let next = AtomicUsize::new(0);
+    let barrier = Barrier::new(threads);
     let tallies: Vec<Vec<Tally>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
-                let (parsed, next, output) = (&parsed, &next, &output);
+                let (parsed, next, output, barrier) = (&parsed, &next, &output, &barrier);
                 scope.spawn(move || {
                     let mut worker = Worker::new(context, output, thread);
                     loop {
@@ -1391,6 +1392,10 @@ fn main() {
                         unsafe { worker.partition(parsed, part) };
                     }
                     worker.write_file();
+                    // Once every thread is done reading the records, free
+                    // them here, in parallel, rather than at the exit.
+                    barrier.wait();
+                    unsafe { (*parsed[thread].events.arena()).release() };
                     worker.tallies
                 })
             })

@@ -311,4 +311,13 @@ pub unsafe fn run<const N: usize>(
         }
         from += consumed;
     }
+    if !task.tail {
+        // Done with these pages: unmapping them now, on every thread, is
+        // cheaper than leaving them all to the exit.
+        let first = (task.from + 4095) & !4095;
+        let last = task.to & !4095;
+        if last > first {
+            libc::madvise(input.base.add(first) as *mut libc::c_void, last - first, libc::MADV_DONTNEED);
+        }
+    }
 }
