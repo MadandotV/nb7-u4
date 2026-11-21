@@ -1264,6 +1264,15 @@ fn csv_files(folder: &Path) -> Vec<PathBuf> {
 
 fn main() {
     let started = Instant::now();
+    // One malloc arena that grows in large steps and never maps per
+    // allocation: each mmap, munmap or mprotect that malloc makes takes a
+    // process-wide lock that every thread's page faults wait on.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 1);
+        libc::mallopt(libc::M_TOP_PAD, 64 << 20);
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 30);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 1 << 30);
+    }
     let arguments: Vec<String> = std::env::args().collect();
     let pick = |at: usize, name: &str, default: &str| {
         if arguments.len() >= 3 {

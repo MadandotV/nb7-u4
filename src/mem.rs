@@ -3,22 +3,61 @@
 
 use std::arch::x86_64::*;
 
-/// Zeroed, page-aligned memory that is never freed. `populate` maps it all
-/// now, in one call, instead of a fault per page.
+const HUGE: usize = 2 << 20;
+
+/// How the kernel hands out 2 MB pages.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Huge {
+    /// To any large mapping.
+    Always,
+    /// Only to mappings that ask.
+    OnRequest,
+    Never,
+}
+
+pub fn huge_pages() -> Huge {
+    use std::sync::OnceLock;
+    static MODE: OnceLock<Huge> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = std::fs::read("/sys/kernel/mm/transparent_hugepage/enabled").unwrap_or_default();
+        let has = |word: &[u8]| mode.windows(word.len()).any(|window| window == word);
+        if std::env::var_os("SHOPSESS_SMALL_PAGES").is_some() {
+            Huge::Never
+        } else if has(b"[always]") {
+            Huge::Always
+        } else if has(b"[madvise]") {
+            Huge::OnRequest
+        } else {
+            Huge::Never
+        }
+    })
+}
+
+/// Zeroed memory that is never freed, aligned to 2 MB so that it can sit on
+/// 2 MB pages: the record streams and tables are written all over, and with
+/// 4 KB pages most of those writes miss the TLB. It asks for large pages
+/// only where the kernel needs asking, since asking also lets the kernel
+/// stall the caller to defragment memory. `populate` maps small pages now,
+/// in one call, when large ones are not to be had.
 pub fn zeroed(bytes: usize, populate: bool) -> *mut u8 {
     let bytes = bytes.max(4096);
     let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
+    let huge = huge_pages();
     unsafe {
         let at = libc::mmap(
             std::ptr::null_mut(),
-            bytes,
+            bytes + HUGE,
             libc::PROT_READ | libc::PROT_WRITE,
-            if populate { flags | libc::MAP_POPULATE } else { flags },
+            if populate && huge == Huge::Never { flags | libc::MAP_POPULATE } else { flags },
             -1,
             0,
         );
         assert!(at != libc::MAP_FAILED, "mmap failed");
-        at as *mut u8
+        let at = ((at as usize + HUGE - 1) & !(HUGE - 1)) as *mut u8;
+        if huge == Huge::OnRequest {
+            libc::madvise(at as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
+        }
+        at
     }
 }
 
@@ -50,6 +89,10 @@ impl Arena {
 
     /// Gives the memory back. Nothing may use it afterwards.
     pub unsafe fn release(&mut self) {
+        if huge_pages() != Huge::Never {
+            // A few hundred large pages cost the exit next to nothing.
+            return;
+        }
         for &(at, _) in &self.regions {
             let used = if at == self.regions.last().unwrap().0 { self.mapped as usize - at as usize } else { self.reserve };
             libc::madvise(at as *mut libc::c_void, used, libc::MADV_DONTNEED);
@@ -69,7 +112,7 @@ impl Arena {
         }
         let out = self.at;
         self.at = self.at.add(bytes);
-        while self.mapped < self.at {
+        while self.mapped < self.at && huge_pages() == Huge::Never {
             // Without this call the pages are mapped one fault at a time, which is slower but works.
             libc::madvise(self.mapped as *mut libc::c_void, STEP, libc::MADV_POPULATE_WRITE);
             self.mapped = self.mapped.add(STEP);
